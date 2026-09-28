@@ -19,7 +19,7 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-BOT_TOKEN = "8563063962:AAEeI8rgLBv8ZWjGQddqjW1QVCy78sF5cpc"
+BOT_TOKEN = "8563063962:AAE8JCad_gceirSwOYM2162blqq_bD54MkQ"
 ADMIN_ID = 1260202941  # Ваш Telegram ID
 CHANNEL_LINK = "https://t.me/ksp_print"
 

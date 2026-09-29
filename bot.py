@@ -13,7 +13,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
-from pypdf import PdfReader, PdfWriter
+from pypdf import PdfReader, PdfWriter, PageObject, Transformation
 from reportlab.lib.colors import HexColor
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
@@ -30,7 +30,7 @@ dp = Dispatcher()
 user_files_buffer = defaultdict(list)
 user_tasks = {}
 user_photo_tasks = {}
-user_pick_lists = {}  # Хранение листов сборки и данных по доставке
+user_pick_lists = {}
 
 # Регистрация кириллического шрифта
 FONT_NAME = 'Helvetica'
@@ -66,6 +66,7 @@ def init_db():
             last_active_date TEXT,
             user_batch_counter INTEGER DEFAULT 1,
             duplicate_mode INTEGER DEFAULT 0,
+            paper_format TEXT DEFAULT 'thermal',
             referrer_id INTEGER DEFAULT NULL,
             referrals_count INTEGER DEFAULT 0,
             subscription_expires TEXT DEFAULT NULL,
@@ -74,7 +75,6 @@ def init_db():
         )
     """)
     
-    # Таблица истории обработанных партий для статистики
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS batch_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,7 +84,6 @@ def init_db():
         )
     """)
 
-    # Таблица для отслеживания отправленных уведомлений о подписке
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sub_notifications (
             user_id INTEGER,
@@ -101,6 +100,8 @@ def init_db():
         cursor.execute("ALTER TABLE users ADD COLUMN user_batch_counter INTEGER DEFAULT 1")
     if "duplicate_mode" not in columns:
         cursor.execute("ALTER TABLE users ADD COLUMN duplicate_mode INTEGER DEFAULT 0")
+    if "paper_format" not in columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN paper_format TEXT DEFAULT 'thermal'")
     if "referrer_id" not in columns:
         cursor.execute("ALTER TABLE users ADD COLUMN referrer_id INTEGER DEFAULT NULL")
     if "referrals_count" not in columns:
@@ -125,7 +126,7 @@ def get_or_create_user(user_id: int, username: str = None, referrer_id: int = No
     
     cursor.execute(
         """SELECT daily_limit, bonus_limit, used_today, last_active_date, 
-                  user_batch_counter, duplicate_mode, referrals_count, 
+                  user_batch_counter, duplicate_mode, paper_format, referrals_count, 
                   subscription_expires, is_unlimited, total_orders_count 
            FROM users WHERE user_id = ?""", 
         (user_id,)
@@ -141,13 +142,13 @@ def get_or_create_user(user_id: int, username: str = None, referrer_id: int = No
         cursor.execute(
             """INSERT INTO users 
                (user_id, username, daily_limit, bonus_limit, used_today, last_active_date, 
-                user_batch_counter, duplicate_mode, referrer_id, referrals_count, subscription_expires, is_unlimited, total_orders_count) 
-               VALUES (?, ?, 35, 0, 0, ?, 1, 0, ?, 0, NULL, 0, 0)""",
+                user_batch_counter, duplicate_mode, paper_format, referrer_id, referrals_count, subscription_expires, is_unlimited, total_orders_count) 
+               VALUES (?, ?, 35, 0, 0, ?, 1, 0, 'thermal', ?, 0, NULL, 0, 0)""",
             (user_id, username, today_str, valid_referrer)
         )
         conn.commit()
         
-        daily_limit, bonus_limit, used_today, batch_cnt, dup_mode, refs_count = 35, 0, 0, 1, 0, 0
+        daily_limit, bonus_limit, used_today, batch_cnt, dup_mode, paper_fmt, refs_count = 35, 0, 0, 1, 0, 'thermal', 0
         sub_expires, is_unlimited, total_orders = None, 0, 0
         
         if valid_referrer:
@@ -157,7 +158,7 @@ def get_or_create_user(user_id: int, username: str = None, referrer_id: int = No
             )
             conn.commit()
     else:
-        daily_limit, bonus_limit, used_today, last_date, batch_cnt, dup_mode, refs_count, sub_expires, is_unlimited, total_orders = row
+        daily_limit, bonus_limit, used_today, last_date, batch_cnt, dup_mode, paper_fmt, refs_count, sub_expires, is_unlimited, total_orders = row
         if username:
             cursor.execute("UPDATE users SET username = ? WHERE user_id = ?", (username, user_id))
             conn.commit()
@@ -191,6 +192,7 @@ def get_or_create_user(user_id: int, username: str = None, referrer_id: int = No
         "max_allowed": daily_limit + bonus_limit,
         "user_batch_counter": batch_cnt,
         "duplicate_mode": bool(dup_mode),
+        "paper_format": paper_fmt or 'thermal',
         "referrals_count": refs_count,
         "is_new_user": is_new_user,
         "has_active_sub": has_active_sub,
@@ -222,35 +224,31 @@ def update_user_usage_and_batch(user_id: int, added_count: int):
     conn.close()
 
 
-def get_monthly_statistics(user_id: int):
-    """Возвращает статистику за текущий календарный месяц."""
+def set_user_paper_format(user_id: int, paper_format: str):
     conn = sqlite3.connect("db.sqlite3")
     cursor = conn.cursor()
-    
+    cursor.execute("UPDATE users SET paper_format = ? WHERE user_id = ?", (paper_format, user_id))
+    conn.commit()
+    conn.close()
+
+
+def get_monthly_statistics(user_id: int):
+    conn = sqlite3.connect("db.sqlite3")
+    cursor = conn.cursor()
     first_day_of_month = date.today().replace(day=1).isoformat()
-    
     cursor.execute("""
         SELECT SUM(orders_count), COUNT(id)
         FROM batch_history
         WHERE user_id = ? AND processed_at >= ?
     """, (user_id, first_day_of_month))
-    
     row = cursor.fetchone()
     conn.close()
-    
     monthly_orders = row[0] if row[0] else 0
     batches_count = row[1] if row[1] else 0
-    
     saved_minutes_total = monthly_orders * 0.5
     hours = int(saved_minutes_total // 60)
     minutes = int(saved_minutes_total % 60)
-    
-    return {
-        "monthly_orders": monthly_orders,
-        "batches_count": batches_count,
-        "hours": hours,
-        "minutes": minutes
-    }
+    return {"monthly_orders": monthly_orders, "batches_count": batches_count, "hours": hours, "minutes": minutes}
 
 
 def toggle_user_duplicate_mode(user_id: int) -> bool:
@@ -266,9 +264,95 @@ def toggle_user_duplicate_mode(user_id: int) -> bool:
     return bool(new_mode)
 
 
-# --- ФУНКЦИЯ ОПРЕДЕЛЕНИЯ ТИПА ДОСТАВКИ И ПАРСИНГА ---
+# --- ФУНКЦИИ РАСКЛАДКИ А4 И ОБРЕЗКИ ---
+def create_a4_grid_background(mode="4in1") -> io.BytesIO:
+    packet = io.BytesIO()
+    c = canvas.Canvas(packet, pagesize=(595.27, 841.89))
+    c.setDash(4, 4)
+    c.setStrokeColor(HexColor("#AAAAAA"))
+    c.setLineWidth(0.5)
+
+    if mode == "4in1":
+        c.line(0, 420.94, 595.27, 420.94)
+        c.line(297.63, 0, 297.63, 841.89)
+    elif mode == "8in1":
+        c.line(297.63, 0, 297.63, 841.89)
+        for i in range(1, 4):
+            y = i * 210.47
+            c.line(0, y, 595.27, y)
+    elif mode == "9in1":
+        for i in range(1, 3):
+            x = i * 198.42
+            c.line(x, 0, x, 841.89)
+            y = i * 280.63
+            c.line(0, y, 595.27, y)
+
+    c.save()
+    packet.seek(0)
+    return packet
+
+
+def merge_pages_n_up(pages_list, mode="4in1"):
+    writer = PdfWriter()
+    a4_w, a4_h = 595.27, 841.89
+
+    if mode == "4in1":
+        items_per_page, cols, rows = 4, 2, 2
+        cell_w, cell_h = 297.63, 420.94
+    elif mode == "8in1":
+        items_per_page, cols, rows = 8, 2, 4
+        cell_w, cell_h = 297.63, 210.47
+    elif mode == "9in1":
+        items_per_page, cols, rows = 9, 3, 3
+        cell_w, cell_h = 198.42, 280.63
+    else:
+        items_per_page, cols, rows = 4, 2, 2
+        cell_w, cell_h = 297.63, 420.94
+
+    grid_bg_stream = create_a4_grid_background(mode)
+    grid_bg_reader = PdfReader(grid_bg_stream)
+    grid_bg_page = grid_bg_reader.pages[0]
+
+    for i in range(0, len(pages_list), items_per_page):
+        batch = pages_list[i:i + items_per_page]
+        new_page = PageObject.create_blank_page(width=a4_w, height=a4_h)
+        new_page.merge_page(grid_bg_page)
+
+        for idx, original_p in enumerate(batch):
+            row = rows - 1 - (idx // cols)
+            col = idx % cols
+            tx = col * cell_w
+            ty = row * cell_h
+
+            p_w = float(original_p.mediabox.width)
+            p_h = float(original_p.mediabox.height)
+
+            scale = min(cell_w / p_w, cell_h / p_h) * 0.95
+
+            offset_x = tx + (cell_w - p_w * scale) / 2
+            offset_y = ty + (cell_h - p_h * scale) / 2
+
+            transform = Transformation().scale(scale, scale).translate(offset_x, offset_y)
+            
+            p_copy = PageObject.create_blank_page(width=p_w, height=p_h)
+            p_copy.merge_page(original_p)
+            p_copy.add_transformation(transform)
+            new_page.merge_page(p_copy)
+
+        writer.add_page(new_page)
+
+    return writer
+
+
+def crop_a4_top_left_to_thermal(page):
+    page.mediabox.lower_left = (0, 420)
+    page.mediabox.upper_right = (298, 842)
+    page.cropbox.lower_left = (0, 420)
+    page.cropbox.upper_right = (298, 842)
+    return page
+
+
 def detect_delivery_type(text: str) -> str:
-    """Определяет тип доставки по тексту накладной Kaspi."""
     text_lower = text.lower()
     if "express" in text_lower or "яндекс" in text_lower or "достависта" in text_lower:
         return "⚡️ Kaspi Express / Яндекс"
@@ -330,13 +414,34 @@ def get_batch_result_keyboard(batch_num: int):
     return builder.as_markup()
 
 
-def get_settings_inline_keyboard(duplicate_enabled: bool):
+def get_settings_inline_keyboard(duplicate_enabled: bool, paper_format: str):
     builder = InlineKeyboardBuilder()
-    status_text = "🟢 ВКЛ" if duplicate_enabled else "🔴 ВЫКЛ"
-    builder.button(
-        text=f"📄 Дублировать этикетки: [{status_text}]", 
-        callback_data="toggle_duplicate"
-    )
+    dup_status = "🟢 ВКЛ" if duplicate_enabled else "🔴 ВЫКЛ"
+    
+    formats_labels = {
+        "thermal": "🏷 Термопринтер (Без изм.)",
+        "a4_crop_thermal": "✂️ А4 на термопринтер (Обрезка)",
+        "a4_4in1": "📄 4 на 1 лист (А4)",
+        "a4_8in1": "📄 8 на 1 лист (А4)",
+        "a4_9in1": "📄 9 на 1 лист (А4)"
+    }
+    current_fmt_label = formats_labels.get(paper_format, "🏷 Термопринтер")
+    
+    builder.button(text=f"📄 Дублирование этикеток: [{dup_status}]", callback_data="toggle_duplicate")
+    builder.button(text=f"🖨 Формат печати: [{current_fmt_label}]", callback_data="change_paper_format")
+    builder.adjust(1, 1)
+    return builder.as_markup()
+
+
+def get_paper_format_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🏷 Термопринтер (Без изменений)", callback_data="set_fmt_thermal")
+    builder.button(text="✂️ А4 на термопринтер (Авто-обрезка 1/4 листа)", callback_data="set_fmt_a4_crop_thermal")
+    builder.button(text="📄 4 на 1 лист (А4 с пунктиром)", callback_data="set_fmt_a4_4in1")
+    builder.button(text="📄 8 на 1 лист (А4 с пунктиром)", callback_data="set_fmt_a4_8in1")
+    builder.button(text="📄 9 на 1 лист (А4 с пунктиром)", callback_data="set_fmt_a4_9in1")
+    builder.button(text="⬅️ Назад", callback_data="back_to_settings")
+    builder.adjust(1)
     return builder.as_markup()
 
 
@@ -360,7 +465,6 @@ TARIFFS_MAIN_TEXT = (
     "👇 <b>Выберите тип тарифа для перевода или онлайн-оплаты:</b>"
 )
 
-
 def get_main_tariff_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -371,7 +475,6 @@ def get_main_tariff_keyboard() -> InlineKeyboardMarkup:
         ]
     )
 
-
 def get_packages_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -381,7 +484,6 @@ def get_packages_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_tariffs_main")]
         ]
     )
-
 
 def get_subscriptions_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -394,97 +496,70 @@ def get_subscriptions_keyboard() -> InlineKeyboardMarkup:
         ]
     )
 
-
 # --- ГЕНЕРАЦИЯ СТРАНИЦ И ОБЛОЖЕК В PDF ---
 def create_cover_page(batch_number: int, total_orders: int, date_str: str) -> io.BytesIO:
     packet = io.BytesIO()
     c = canvas.Canvas(packet, pagesize=(212, 340))
-    
-    DARK_RED = HexColor("#7A0000")
-    BLACK_CARD = HexColor("#0A0A0A")
-    WHITE = HexColor("#FFFFFF")
-    TEXT_MUTED = HexColor("#444444")
-    
-    c.setFillColor(DARK_RED)
+    c.setFillColor(HexColor("#7A0000"))
     c.roundRect(10, 260, 192, 65, 12, fill=True, stroke=False)
-    
-    c.setFillColor(WHITE)
+    c.setFillColor(HexColor("#FFFFFF"))
     c.setFont(FONT_NAME, 18)
     c.drawCentredString(106, 287, "KaspiPrint")
-    
-    c.setFillColor(DARK_RED)
+    c.setFillColor(HexColor("#7A0000"))
     c.roundRect(25, 205, 162, 28, 14, fill=True, stroke=False)
-    
-    c.setFillColor(WHITE)
+    c.setFillColor(HexColor("#FFFFFF"))
     c.setFont(FONT_NAME, 9)
     c.drawCentredString(106, 214, f"ПАРТИЯ №{batch_number} сформирована!")
-    
-    c.setFillColor(BLACK_CARD)
+    c.setFillColor(HexColor("#0A0A0A"))
     c.roundRect(15, 115, 182, 70, 10, fill=True, stroke=False)
-    
-    c.setFillColor(WHITE)
+    c.setFillColor(HexColor("#FFFFFF"))
     c.setFont(FONT_NAME, 9)
     c.drawString(28, 158, f"Дата/Время: {date_str}")
     c.drawString(28, 132, f"ВСЕГО ЗАКАЗОВ В ПАРТИИ: {total_orders} ШТ.")
-    
-    c.setFillColor(TEXT_MUTED)
+    c.setFillColor(HexColor("#444444"))
     c.setFont(FONT_NAME, 6)
     c.drawCentredString(106, 35, "Печатайте файл и собирайте заказы по порядку!")
-    
     c.save()
     packet.seek(0)
     return packet
-
 
 def create_delivery_group_cover(group_title: str, count: int) -> io.BytesIO:
     packet = io.BytesIO()
     c = canvas.Canvas(packet, pagesize=(212, 340))
-    
     c.setFillColor(HexColor("#0A0A0A"))
     c.rect(0, 0, 212, 340, fill=True, stroke=False)
-    
     c.setFillColor(HexColor("#FF3B30"))
     c.roundRect(10, 200, 192, 100, 10, fill=True, stroke=False)
-    
     c.setFillColor(HexColor("#FFFFFF"))
     c.setFont(FONT_NAME, 10)
     c.drawCentredString(106, 265, group_title.upper())
-    
     c.setFont(FONT_NAME, 14)
     c.drawCentredString(106, 230, f"ЗАКАЗОВ: {count} ШТ.")
-    
     c.setFont(FONT_NAME, 8)
     c.drawCentredString(106, 120, "Далее идут накладные этой категории")
-    
     c.save()
     packet.seek(0)
     return packet
-
 
 def create_number_stamp(current_idx: int, total_orders: int, is_landscape: bool = False) -> io.BytesIO:
     packet = io.BytesIO()
     pagesize = (340, 212) if is_landscape else (212, 340)
     c = canvas.Canvas(packet, pagesize=pagesize)
-    
     x_pos = pagesize[0] - 82
     c.setFillColor(HexColor("#FFFFFF"))
     c.rect(x_pos, 5, 75, 15, fill=True, stroke=False)
-    
     c.setFillColor(HexColor("#000000"))
     c.setFont(FONT_NAME, 8)
     c.drawString(x_pos + 5, 10, f"№ {current_idx} из {total_orders}")
-    
     c.save()
     packet.seek(0)
     return packet
 
-
-# --- ОБРАБОТЧИК СТАТИСТИКИ КЛИЕНТА ---
+# --- АДМИН-ФУНКЦИИ И СТАТИСТИКА ---
 @dp.message(F.text == "📊 Статистика за месяц")
 async def show_monthly_stats(message: types.Message):
     user_id = message.from_user.id
     stats = get_monthly_statistics(user_id)
-    
     time_saved_str = ""
     if stats["hours"] > 0:
         time_saved_str += f"<b>{stats['hours']} ч.</b> "
@@ -500,44 +575,24 @@ async def show_monthly_stats(message: types.Message):
         parse_mode="HTML"
     )
 
-
-# --- ⚙️ НОВЫЕ АДМИН-ФУНКЦИИ (STATS, BROADCAST, NOTIFICATIONS) ---
-
-# 1. ОБЩАЯ СТАТИСТИКА БОТА ДЛЯ ВЛАДЕЛЬЦА
 @dp.message(Command("stats"))
 async def admin_bot_stats(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
+    if message.from_user.id != ADMIN_ID: return
     conn = sqlite3.connect("db.sqlite3")
     cursor = conn.cursor()
-
-    # Всего пользователей
     cursor.execute("SELECT COUNT(user_id) FROM users")
     total_users = cursor.fetchone()[0] or 0
-
-    # Активных подписок
     today_str = date.today().isoformat()
-    cursor.execute(
-        "SELECT COUNT(user_id) FROM users WHERE is_unlimited = 1 OR (subscription_expires IS NOT NULL AND subscription_expires >= ?)",
-        (today_str,)
-    )
+    cursor.execute("SELECT COUNT(user_id) FROM users WHERE is_unlimited = 1 OR (subscription_expires IS NOT NULL AND subscription_expires >= ?)", (today_str,))
     active_subs = cursor.fetchone()[0] or 0
-
-    # Заказов за сегодня
     cursor.execute("SELECT SUM(orders_count) FROM batch_history WHERE processed_at >= ?", (today_str,))
     orders_today = cursor.fetchone()[0] or 0
-
-    # Заказов за 7 дней
     seven_days_ago = (date.today() - timedelta(days=7)).isoformat()
     cursor.execute("SELECT SUM(orders_count) FROM batch_history WHERE processed_at >= ?", (seven_days_ago,))
     orders_7days = cursor.fetchone()[0] or 0
-
-    # Заказов за текущий месяц
     first_day_month = date.today().replace(day=1).isoformat()
     cursor.execute("SELECT SUM(orders_count) FROM batch_history WHERE processed_at >= ?", (first_day_month,))
     orders_month = cursor.fetchone()[0] or 0
-
     conn.close()
 
     await message.answer(
@@ -551,782 +606,385 @@ async def admin_bot_stats(message: types.Message):
         parse_mode="HTML"
     )
 
-
-# 2. МАССОВАЯ РАССЫЛКА ДЛЯ ВСЕХ ПОЛЬЗОВАТЕЛЕЙ
 @dp.message(Command("broadcast"))
 async def admin_broadcast(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
+    if message.from_user.id != ADMIN_ID: return
     text_to_send = message.text.replace("/broadcast", "").strip()
     if not text_to_send:
-        await message.answer(
-            "📢 <b>Использование рассылки:</b>\n\n"
-            "<code>/broadcast Ваш текст анонса или новости</code>\n\n"
-            "<i>Поддерживается форматирование HTML (жирный, ссылки и т.д.)</i>",
-            parse_mode="HTML"
-        )
+        await message.answer("📢 <b>Использование рассылки:</b>\n\n<code>/broadcast Ваш текст</code>", parse_mode="HTML")
         return
-
     conn = sqlite3.connect("db.sqlite3")
     cursor = conn.cursor()
     cursor.execute("SELECT user_id FROM users")
     users = cursor.fetchall()
     conn.close()
-
     status_msg = await message.answer(f"🚀 Начинаю рассылку для {len(users)} пользователей...")
-
-    success_count = 0
-    fail_count = 0
-
+    success_count, fail_count = 0, 0
     for u in users:
-        uid = u[0]
         try:
-            await bot.send_message(uid, text_to_send, parse_mode="HTML", disable_web_page_preview=True)
+            await bot.send_message(u[0], text_to_send, parse_mode="HTML", disable_web_page_preview=True)
             success_count += 1
-            await asyncio.sleep(0.05)  # Защита от лимитов Telegram API
+            await asyncio.sleep(0.05)
         except Exception:
             fail_count += 1
+    await status_msg.edit_text(f"✅ <b>Рассылка завершена!</b>\n\n📥 Доставлено: <code>{success_count}</code>\n❌ Ошибок: <code>{fail_count}</code>", parse_mode="HTML")
 
-    await status_msg.edit_text(
-        f"✅ <b>Рассылка завершена!</b>\n\n"
-        f"📥 Успешно доставлено: <code>{success_count}</code>\n"
-        f"❌ Ошибок (заблокировали бота): <code>{fail_count}</code>",
-        parse_mode="HTML"
-    )
-
-
-# 3. АВТОМАТИЧЕСКИЕ УВЕДОМЛЕНИЯ О ЗАВЕРШЕНИИ ПОДПИСКИ (3 ДНЯ И 1 ДЕНЬ)
 async def check_subscription_expirations():
-    """Фоновая задача, ежедневно проверяющая истекающие подписки."""
     while True:
         try:
             today = date.today()
-            today_str = today.isoformat()
-            day_3_str = (today + timedelta(days=3)).isoformat()
-            day_1_str = (today + timedelta(days=1)).isoformat()
-
+            today_str, day_3_str, day_1_str = today.isoformat(), (today + timedelta(days=3)).isoformat(), (today + timedelta(days=1)).isoformat()
             conn = sqlite3.connect("db.sqlite3")
             cursor = conn.cursor()
-
-            renew_keyboard = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="⭐ Продлить подписку", callback_data="category_subscriptions")],
-                    [InlineKeyboardButton(text="💬 Менеджер", url="https://t.me/baur_bkh")]
-                ]
-            )
-
-            # Напоминание за 3 дня
-            cursor.execute("""
-                SELECT user_id FROM users 
-                WHERE is_unlimited = 0 AND subscription_expires = ?
-            """, (day_3_str,))
-            users_3d = cursor.fetchall()
-
-            for (uid,) in users_3d:
-                cursor.execute(
-                    "SELECT 1 FROM sub_notifications WHERE user_id = ? AND notify_type = '3d' AND sent_date = ?",
-                    (uid, today_str)
-                )
+            renew_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⭐ Продлить подписку", callback_data="category_subscriptions")],
+                [InlineKeyboardButton(text="💬 Менеджер", url="https://t.me/baur_bkh")]
+            ])
+            cursor.execute("SELECT user_id FROM users WHERE is_unlimited = 0 AND subscription_expires = ?", (day_3_str,))
+            for (uid,) in cursor.fetchall():
+                cursor.execute("SELECT 1 FROM sub_notifications WHERE user_id = ? AND notify_type = '3d' AND sent_date = ?", (uid, today_str))
                 if not cursor.fetchone():
                     try:
-                        await bot.send_message(
-                            uid,
-                            f"⏰ <b>Напоминание о подписке KaspiPrint!</b>\n\n"
-                            f"Ваша безлимитная подписка завершится через <b>3 дня</b> ({day_3_str}).\n\n"
-                            f"Продлите подписку заранее, чтобы не терять доступ к авто-сортировке курьеров и Листу сборки!",
-                            reply_markup=renew_keyboard,
-                            parse_mode="HTML"
-                        )
-                        cursor.execute(
-                            "INSERT INTO sub_notifications (user_id, notify_type, sent_date) VALUES (?, '3d', ?)",
-                            (uid, today_str)
-                        )
+                        await bot.send_message(uid, f"⏰ <b>Ваша подписка KaspiPrint завершится через 3 дня!</b>\nПродлите подписку заранее.", reply_markup=renew_keyboard, parse_mode="HTML")
+                        cursor.execute("INSERT INTO sub_notifications VALUES (?, '3d', ?)", (uid, today_str))
                         conn.commit()
-                    except Exception:
-                        pass
-
-            # Напоминание за 1 день
-            cursor.execute("""
-                SELECT user_id FROM users 
-                WHERE is_unlimited = 0 AND subscription_expires = ?
-            """, (day_1_str,))
-            users_1d = cursor.fetchall()
-
-            for (uid,) in users_1d:
-                cursor.execute(
-                    "SELECT 1 FROM sub_notifications WHERE user_id = ? AND notify_type = '1d' AND sent_date = ?",
-                    (uid, today_str)
-                )
+                    except: pass
+            cursor.execute("SELECT user_id FROM users WHERE is_unlimited = 0 AND subscription_expires = ?", (day_1_str,))
+            for (uid,) in cursor.fetchall():
+                cursor.execute("SELECT 1 FROM sub_notifications WHERE user_id = ? AND notify_type = '1d' AND sent_date = ?", (uid, today_str))
                 if not cursor.fetchone():
                     try:
-                        await bot.send_message(
-                            uid,
-                            f"⚠️ <b>Подписка истекает завтра!</b>\n\n"
-                            f"Завтра ({day_1_str}) ваш доступ к премиум-функциям будет приостановлен.\n\n"
-                            f"Нажмите кнопку ниже, чтобы продлить доступ в 1 клик 👇",
-                            reply_markup=renew_keyboard,
-                            parse_mode="HTML"
-                        )
-                        cursor.execute(
-                            "INSERT INTO sub_notifications (user_id, notify_type, sent_date) VALUES (?, '1d', ?)",
-                            (uid, today_str)
-                        )
+                        await bot.send_message(uid, f"⚠️ <b>Подписка истекает завтра!</b>\nЗавтра доступ к функциям будет приостановлен.", reply_markup=renew_keyboard, parse_mode="HTML")
+                        cursor.execute("INSERT INTO sub_notifications VALUES (?, '1d', ?)", (uid, today_str))
                         conn.commit()
-                    except Exception:
-                        pass
-
+                    except: pass
             conn.close()
-
-        except Exception as e:
-            print(f"Ошибка в фоновом планировщике подписок: {e}")
-
-        # Проверка 1 раз в сутки (86400 секунд)
+        except: pass
         await asyncio.sleep(86400)
 
-
-# --- СТАРАЯ АДМИН-ПАНЕЛЬ (/sub, /ksprnt) ---
 @dp.message(Command("sub"))
 async def admin_manage_subscriptions(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
+    if message.from_user.id != ADMIN_ID: return
     args = message.text.split()
     if len(args) < 3:
-        await message.answer(
-            "👑 <b>Админ-панель управления подписками:</b>\n\n"
-            "• <code>/sub +30d @username</code> — выдать подписку на 30 дней\n"
-            "• <code>/sub +3m @username</code> — выдать подписку на 3 месяца\n"
-            "• <code>/sub +1y @username</code> — выдать подписку на 1 год\n"
-            "• <code>/sub inf @username</code> — выдать <b>вечный безлимит</b>\n"
-            "• <code>/sub del @username</code> — ❌ <b>удалить подписку</b>\n\n"
-            "<i>Вместо @username можно писать ID Telegram</i>",
-            parse_mode="HTML"
-        )
+        await message.answer("👑 Управление подписками: /sub +30d @username | /sub inf @username | /sub del @username", parse_mode="HTML")
         return
-
-    action = args[1].lower()
-    target = args[2].replace("@", "")
-
+    action, target = args[1].lower(), args[2].replace("@", "")
     conn = sqlite3.connect("db.sqlite3")
     cursor = conn.cursor()
-
-    if target.isdigit():
-        cursor.execute("SELECT user_id, username FROM users WHERE user_id = ?", (int(target),))
-    else:
-        cursor.execute("SELECT user_id, username FROM users WHERE LOWER(username) = LOWER(?)", (target,))
-
+    cursor.execute("SELECT user_id, username FROM users WHERE user_id = ?" if target.isdigit() else "SELECT user_id, username FROM users WHERE LOWER(username) = LOWER(?)", (target if not target.isdigit() else int(target),))
     row = cursor.fetchone()
     if not row:
         conn.close()
-        await message.answer(f"❌ Пользователь <code>{target}</code> не найден в базе данных.", parse_mode="HTML")
+        await message.answer(f"❌ Пользователь не найден.", parse_mode="HTML")
         return
-
-    target_id, target_username = row
-    user_label = f"@{target_username}" if target_username else f"ID: {target_id}"
-
+    target_id = row[0]
     if action == "del":
-        cursor.execute(
-            "UPDATE users SET subscription_expires = NULL, is_unlimited = 0 WHERE user_id = ?", 
-            (target_id,)
-        )
-        conn.commit()
-        conn.close()
-        await message.answer(f"❌ Подписка пользователя {user_label} <b>аннулирована</b>.", parse_mode="HTML")
-        try:
-            await bot.send_message(target_id, "ℹ️ Ваша безлимитная подписка была завершена администратором.")
-        except Exception:
-            pass
-        return
-
-    days_to_add = 0
-    is_inf = False
-
-    if action in ["+30d", "+1m"]:
-        days_to_add = 30
-    elif action == "+3m":
-        days_to_add = 90
-    elif action in ["+1y", "+12m"]:
-        days_to_add = 365
+        cursor.execute("UPDATE users SET subscription_expires = NULL, is_unlimited = 0 WHERE user_id = ?", (target_id,))
+        await message.answer("❌ Подписка аннулирована.", parse_mode="HTML")
     elif action == "inf":
-        is_inf = True
-    else:
-        conn.close()
-        await message.answer("❌ Неизвестная команда длительности.")
-        return
-
-    if is_inf:
         cursor.execute("UPDATE users SET is_unlimited = 1, subscription_expires = NULL WHERE user_id = ?", (target_id,))
-        conn.commit()
-        conn.close()
-        await message.answer(f"🎉 Пользователю {user_label} выдан <b>ВЕЧНЫЙ БЕЗЛИМИТ</b>!", parse_mode="HTML")
-        try:
-            await bot.send_message(target_id, "👑 Вам активирован <b>ВЕЧНЫЙ БЕЗЛИМИТ</b>! Наслаждайтесь свободной печатью!", parse_mode="HTML")
-        except Exception:
-            pass
+        await message.answer("🎉 Выдан ВЕЧНЫЙ БЕЗЛИМИТ!", parse_mode="HTML")
     else:
-        new_exp_date = date.today() + timedelta(days=days_to_add)
-        exp_str = new_exp_date.isoformat()
-        cursor.execute("UPDATE users SET subscription_expires = ?, is_unlimited = 0 WHERE user_id = ?", (exp_str, target_id))
-        conn.commit()
-        conn.close()
-        await message.answer(f"✅ Подписка для {user_label} успешно активирована до <b>{exp_str}</b> (+{days_to_add} дней).", parse_mode="HTML")
-        try:
-            await bot.send_message(target_id, f"🎉 Вам активирована подписка до <b>{exp_str}</b>!", parse_mode="HTML")
-        except Exception:
-            pass
-
+        days = 30 if action in ["+30d", "+1m"] else 90 if action == "+3m" else 365 if action in ["+1y", "+12m"] else 0
+        if days:
+            exp = (date.today() + timedelta(days=days)).isoformat()
+            cursor.execute("UPDATE users SET subscription_expires = ?, is_unlimited = 0 WHERE user_id = ?", (exp, target_id))
+            await message.answer(f"✅ Подписка активирована до {exp}.", parse_mode="HTML")
+    conn.commit()
+    conn.close()
 
 @dp.message(Command("ksprnt"))
 async def admin_manage_limits(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
+    if message.from_user.id != ADMIN_ID: return
     args = message.text.split()
     if len(args) < 3:
-        await message.answer(
-            "⚙️ <b>Использование команды администратора:</b>\n\n"
-            "• <code>/ksprnt +15 @username</code> — добавить разово +15 лимитов на сегодня\n"
-            "• <code>/ksprnt set 500 @username</code> — установить ежедневный лимит в 500 штук\n",
-            parse_mode="HTML"
-        )
+        await message.answer("⚙️ Лимиты: /ksprnt +15 @username | /ksprnt set 500 @username", parse_mode="HTML")
         return
-
-    action = args[1]
-    target = args[2].replace("@", "")
-
+    action, target = args[1], args[2].replace("@", "")
     conn = sqlite3.connect("db.sqlite3")
     cursor = conn.cursor()
-
-    if target.isdigit():
-        cursor.execute("SELECT user_id, username FROM users WHERE user_id = ?", (int(target),))
-    else:
-        cursor.execute("SELECT user_id, username FROM users WHERE LOWER(username) = LOWER(?)", (target,))
-
+    cursor.execute("SELECT user_id FROM users WHERE user_id = ?" if target.isdigit() else "SELECT user_id FROM users WHERE LOWER(username) = LOWER(?)", (target if not target.isdigit() else int(target),))
     row = cursor.fetchone()
-    if not row:
-        conn.close()
-        await message.answer(f"❌ Пользователь <code>{target}</code> не найден в базе данных бота.", parse_mode="HTML")
-        return
-
-    target_id, target_username = row
-
-    if action.startswith("+"):
-        try:
-            add_val = int(action.replace("+", ""))
-            cursor.execute("UPDATE users SET bonus_limit = bonus_limit + ? WHERE user_id = ?", (add_val, target_id))
-            conn.commit()
-            await message.answer(f"✅ Добавлено <b>+{add_val}</b> доп. лимитов пользователю @{target_username or target_id}.", parse_mode="HTML")
-        except ValueError:
-            await message.answer("❌ Неверное число бонуса.")
-
-    elif action == "set" and len(args) >= 4:
-        try:
-            new_limit = int(args[2])
-            target_user = args[3].replace("@", "")
-            
-            if target_user.isdigit():
-                cursor.execute("UPDATE users SET daily_limit = ? WHERE user_id = ?", (new_limit, int(target_user)))
-            else:
-                cursor.execute("UPDATE users SET daily_limit = ? WHERE LOWER(username) = LOWER(?)", (new_limit, target_user))
-            
-            conn.commit()
-            await message.answer(f"✅ Новый ежедневный лимит для @{target_user}: <b>{new_limit} шт/день</b>.", parse_mode="HTML")
-        except ValueError:
-            await message.answer("❌ Неверно указан лимит.")
-
+    if row:
+        if action.startswith("+"):
+            cursor.execute("UPDATE users SET bonus_limit = bonus_limit + ? WHERE user_id = ?", (int(action[1:]), row[0]))
+            await message.answer("✅ Бонус добавлен.")
+        elif action == "set" and len(args) >= 4:
+            cursor.execute("UPDATE users SET daily_limit = ? WHERE user_id = ?", (int(args[2]), row[0]))
+            await message.answer("✅ Лимит изменен.")
+        conn.commit()
     conn.close()
 
 
+# --- ОБРАБОТЧИКИ ПОЛЬЗОВАТЕЛЯ ---
 @dp.message(CommandStart())
 async def start_handler(message: types.Message):
-    referrer_id = None
-    args = message.text.split()
-    if len(args) > 1 and args[1].startswith("ref"):
-        try:
-            referrer_id = int(args[1].replace("ref", ""))
-        except ValueError:
-            referrer_id = None
-
+    referrer_id = int(message.text.split()[1].replace("ref", "")) if len(message.text.split()) > 1 and message.text.split()[1].startswith("ref") else None
     user_info = get_or_create_user(message.from_user.id, message.from_user.username, referrer_id)
-
     if user_info["is_new_user"] and referrer_id and referrer_id != message.from_user.id:
-        try:
-            await bot.send_message(
-                chat_id=referrer_id,
-                text="🎉 <b>По вашей реферальной ссылке зарегистрировался новый селлер!</b>\n\n"
-                     "🎁 Вам зачислено <b>+10 дополнительных обработок</b>!",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-
-    await message.answer(
-        "🖨 <b>KaspiPrint — Сервис склейки накладных Kaspi</b>\n\n"
-        "Я помогу объединить сотни PDF-накладных или ZIP-архивов в <b>один файл</b> "
-        "для быстрой печати на термопринтере (Xprinter, Zebra и др.), сгруппирую их по службам доставки и сформирую <b>Лист сборки</b>.\n\n"
-        "Выберите нужный раздел в меню ниже 👇",
-        reply_markup=get_main_keyboard(),
-        parse_mode="HTML"
-    )
-
+        try: await bot.send_message(referrer_id, "🎉 <b>По вашей ссылке зарегистрировался селлер!</b>\nВам зачислено +10 обработок!", parse_mode="HTML")
+        except: pass
+    await message.answer("🖨 <b>KaspiPrint — Сервис склейки накладных Kaspi</b>\nОтправьте файлы для сортировки и печати.", reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 @dp.message(F.text == "🚀 Старт бота")
 async def start_work_button(message: types.Message):
-    await message.answer(
-        "📤 <b>Жду ваши файлы!</b>\n\n"
-        "Отправьте сюда ZIP-архив из Kaspi Pay или сразу несколько PDF-файлов с накладными.",
-        reply_markup=get_main_keyboard(),
-        parse_mode="HTML"
-    )
-
+    await message.answer("📤 <b>Жду ваши файлы!</b>\nОтправьте ZIP-архив или несколько PDF.", reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 @dp.message(F.text == "🎁 Приведи друга")
 async def referral_program_handler(message: types.Message):
     bot_info = await bot.get_me()
-    user_id = message.from_user.id
-    user_data = get_or_create_user(user_id, message.from_user.username)
-    
-    ref_link = f"https://t.me/{bot_info.username}?start=ref{user_id}"
-    refs_count = user_data["referrals_count"]
-    
-    await message.answer(
-        f"🤝 <b>Партнёрская программа «Приведи друга»</b>\n\n"
-        f"Делитесь своей персональной ссылкой с коллегами-селлерами Kaspi! "
-        f"За каждого подключённого продавца вы получаете <b>+10 бесплатных обработок</b>.\n\n"
-        f"🔗 <b>Ваша реферальная ссылка:</b>\n<code>{ref_link}</code>\n\n"
-        f"📊 <b>Приведено селлеров:</b> <code>{refs_count} чел.</code>",
-        reply_markup=get_main_keyboard(),
-        parse_mode="HTML"
-    )
-
+    user_data = get_or_create_user(message.from_user.id, message.from_user.username)
+    await message.answer(f"🤝 <b>«Приведи друга»</b>\nПолучайте +10 обработок за каждого!\n🔗 Ваша ссылка: <code>https://t.me/{bot_info.username}?start=ref{message.from_user.id}</code>\n📊 Приведено: {user_data['referrals_count']}", reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 @dp.message(F.text == "⚙️ Настройки")
 async def show_settings(message: types.Message):
     user_data = get_or_create_user(message.from_user.id, message.from_user.username)
-    dup_enabled = user_data["duplicate_mode"]
-    
-    await message.answer(
-        "⚙️ <b>Настройки печати:</b>\n\n"
-        "📌 <b>Дублирование этикеток:</b>\n"
-        "Если включено, бот сделает 2 копии каждой накладной подряд.\n\n"
-        "💡 <i>Дубликаты копируются бесплатно и <b>НЕ списывают</b> ваши дневные лимиты!</i>",
-        reply_markup=get_settings_inline_keyboard(dup_enabled),
-        parse_mode="HTML"
-    )
+    await message.answer("⚙️ <b>Настройки печати:</b>", reply_markup=get_settings_inline_keyboard(user_data["duplicate_mode"], user_data["paper_format"]), parse_mode="HTML")
+
+@dp.callback_query(F.data == "change_paper_format")
+async def process_change_paper_format(callback: CallbackQuery):
+    await callback.message.edit_text("🖨 <b>Выберите используемый формат бумаги / принтера:</b>", reply_markup=get_paper_format_keyboard(), parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("set_fmt_"))
+async def process_set_format(callback: CallbackQuery):
+    fmt = callback.data.replace("set_fmt_", "")
+    set_user_paper_format(callback.from_user.id, fmt)
+    user_data = get_or_create_user(callback.from_user.id)
+    await callback.message.edit_text("✅ <b>Формат печати успешно обновлен!</b>", reply_markup=get_settings_inline_keyboard(user_data["duplicate_mode"], fmt), parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_settings")
+async def back_to_settings_callback(callback: CallbackQuery):
+    user_data = get_or_create_user(callback.from_user.id)
+    await callback.message.edit_text("⚙️ <b>Настройки печати:</b>", reply_markup=get_settings_inline_keyboard(user_data["duplicate_mode"], user_data["paper_format"]), parse_mode="HTML")
+    await callback.answer()
 
 @dp.callback_query(F.data == "toggle_duplicate")
 async def toggle_duplicate_callback(callback: CallbackQuery):
     new_state = toggle_user_duplicate_mode(callback.from_user.id)
-    await callback.message.edit_reply_markup(
-        reply_markup=get_settings_inline_keyboard(new_state)
-    )
-    status_text = "включено" if new_state else "выключено"
-    await callback.answer(f"Дублирование этикеток {status_text}!")
-
+    user_data = get_or_create_user(callback.from_user.id)
+    await callback.message.edit_reply_markup(reply_markup=get_settings_inline_keyboard(new_state, user_data["paper_format"]))
+    await callback.answer(f"Дублирование этикеток {'включено' if new_state else 'выключено'}!")
 
 @dp.message(F.text == "📖 Инструкция")
 async def show_instruction(message: types.Message):
-    await message.answer(
-        "📖 <b>Инструкция по работе:</b>\n\n"
-        "1️⃣ <b>Зайдите в Kaspi Pay</b> ➔ Раздел «Заказы» ➔ Выгрузите накладные (ZIP или отдельные PDF).\n"
-        "2️⃣ <b>Отправьте файлы в этот чат</b>.\n"
-        "3️⃣ <b>Бот объединит их</b>, сгруппирует по курьерам, пронумерует страницы и сформирует обложки.\n"
-        "4️⃣ <b>Получите готовую партию и Лист сборки</b> по кнопке под готовым файлом!",
-        reply_markup=get_main_keyboard(),
-        parse_mode="HTML"
-    )
-
+    await message.answer("📖 Зайдите в Kaspi Pay ➔ Заказы ➔ Выгрузите накладные ➔ Отправьте боту.", reply_markup=get_main_keyboard())
 
 @dp.message(F.text == "📢 Наш канал / Отзывы")
 async def show_channel_info(message: types.Message):
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📢 Перейти в канал", url=CHANNEL_LINK)]
-        ]
-    )
-    await message.answer(
-        "📢 <b>Наш Telegram-канал и Отзывы</b>\n\n"
-        "Подписывайтесь на наш канал, чтобы:\n"
-        "• Первыми узнавать о новых функциях и обновлениях бота\n"
-        "• Читать реальные отзывы селлеров Kaspi\n"
-        "• Получать полезные инструкции по настройке принтеров и оптимизации работы\n\n"
-        "Нажмите на кнопку ниже, чтобы перейти 👇",
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
-
+    await message.answer("📢 Наш канал: Первыми узнавайте об обновлениях", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📢 Перейти в канал", url=CHANNEL_LINK)]]))
 
 @dp.message(F.text.in_(["⭐ Тарифы и подписка", "💳 Тарифы", "/tariffs", "/pay"]))
 async def show_tariffs(message: types.Message):
     user_data = get_or_create_user(message.from_user.id, message.from_user.username)
-    
-    if user_data["is_unlimited"]:
-        sub_info = "👑 <b>Ваш статус:</b> <code>БЕЗЛИМИТНАЯ ПОДПИСКА (ВЕЧНАЯ)</code>\n\n"
-    elif user_data["has_active_sub"]:
-        sub_info = f"🌟 <b>Ваш статус:</b> <code>ПОДПИСКА АКТИВНА до {user_data['sub_expires']}</code>\n\n"
-    else:
-        sub_info = f"📊 <b>Ваш текущий лимит на сегодня:</b> <code>{user_data['used_today']} / {user_data['max_allowed']} шт.</code>\n\n"
-    
-    await message.answer(
-        text=sub_info + TARIFFS_MAIN_TEXT,
-        parse_mode="HTML",
-        reply_markup=get_main_tariff_keyboard()
-    )
-
+    sub_info = "👑 <b>Ваш статус:</b> <code>БЕЗЛИМИТНАЯ ПОДПИСКА (ВЕЧНАЯ)</code>\n\n" if user_data["is_unlimited"] else f"🌟 <b>Ваш статус:</b> <code>ПОДПИСКА АКТИВНА до {user_data['sub_expires']}</code>\n\n" if user_data["has_active_sub"] else f"📊 <b>Ваш текущий лимит на сегодня:</b> <code>{user_data['used_today']} / {user_data['max_allowed']} шт.</code>\n\n"
+    await message.answer(text=sub_info + TARIFFS_MAIN_TEXT, parse_mode="HTML", reply_markup=get_main_tariff_keyboard())
 
 @dp.callback_query(F.data == "category_packages")
 async def process_packages_category(callback: CallbackQuery):
-    await callback.message.edit_text(
-        text="📦 <b>Выберите подходящий пакет документов:</b>\n\nБаланс расходуется по мере работы и не сгорает со временем.",
-        parse_mode="HTML",
-        reply_markup=get_packages_keyboard()
-    )
-    await callback.answer()
-
+    await callback.message.edit_text(text="📦 <b>Выберите подходящий пакет документов:</b>", parse_mode="HTML", reply_markup=get_packages_keyboard())
 
 @dp.callback_query(F.data == "category_subscriptions")
 async def process_subscriptions_category(callback: CallbackQuery):
-    await callback.message.edit_text(
-        text="♾ <b>Выберите период безлимитной подписки:</b>\n\nСоздавайте неограниченное количество накладных.",
-        parse_mode="HTML",
-        reply_markup=get_subscriptions_keyboard()
-    )
-    await callback.answer()
-
+    await callback.message.edit_text(text="♾ <b>Выберите период безлимитной подписки:</b>", parse_mode="HTML", reply_markup=get_subscriptions_keyboard())
 
 @dp.callback_query(F.data == "back_to_tariffs_main")
 async def back_to_main_tariffs(callback: CallbackQuery):
     user_data = get_or_create_user(callback.from_user.id, callback.from_user.username)
-    
-    if user_data["is_unlimited"]:
-        sub_info = "👑 <b>Ваш статус:</b> <code>БЕЗЛИМИТНАЯ ПОДПИСКА (ВЕЧНАЯ)</code>\n\n"
-    elif user_data["has_active_sub"]:
-        sub_info = f"🌟 <b>Ваш статус:</b> <code>ПОДПИСКА АКТИВНА до {user_data['sub_expires']}</code>\n\n"
-    else:
-        sub_info = f"📊 <b>Ваш текущий лимит на сегодня:</b> <code>{user_data['used_today']} / {user_data['max_allowed']} шт.</code>\n\n"
-        
-    await callback.message.edit_text(
-        text=sub_info + TARIFFS_MAIN_TEXT,
-        parse_mode="HTML",
-        reply_markup=get_main_tariff_keyboard()
-    )
-    await callback.answer()
-
+    sub_info = "👑 <b>Ваш статус:</b> <code>БЕЗЛИМИТНАЯ ПОДПИСКА (ВЕЧНАЯ)</code>\n\n" if user_data["is_unlimited"] else f"🌟 <b>Ваш статус:</b> <code>ПОДПИСКА АКТИВНА до {user_data['sub_expires']}</code>\n\n" if user_data["has_active_sub"] else f"📊 <b>Ваш текущий лимит на сегодня:</b> <code>{user_data['used_today']} / {user_data['max_allowed']} шт.</code>\n\n"
+    await callback.message.edit_text(text=sub_info + TARIFFS_MAIN_TEXT, parse_mode="HTML", reply_markup=get_main_tariff_keyboard())
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def process_tariff_selection(callback: CallbackQuery):
-    tariff_names = {
-        "buy_package_start": "🔥 Быстрый Старт (350 шт) — 1 690 ₸",
-        "buy_package_biz": "💼 Пакет «Бизнес» (1200 шт) — 4 990 ₸",
-        "buy_package_test": "🎁 Бесплатный тест (30 шт)",
-        "buy_sub_1m": "🗓 Подписка 1 месяц — 2 990 ₸",
-        "buy_sub_3m": "🗓 Подписка 3 месяца — 7 470 ₸",
-        "buy_sub_6m": "🗓 Подписка 6 месяцев — 12 900 ₸",
-        "buy_sub_12m": "👑 Подписка 12 месяцев — 21 480 ₸"
-    }
-    
-    selected = tariff_names.get(callback.data, "Выбранный тариф")
-    
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-
-    await callback.message.answer(
-        f"💳 <b>Оплата тарифа:</b> {selected}\n\n"
-        f"Для активации тарифа или получения счета на оплату свяжитесь с менеджером:\n"
-        f"👨‍💻 <b>Администратор:</b> @baur_bkh\n\n"
-        f"Укажите ваш ID при обращении: <code>{callback.from_user.id}</code>",
-        parse_mode="HTML"
-    )
-    await callback.answer()
-
+    try: await callback.message.delete()
+    except: pass
+    await callback.message.answer(f"💳 Для активации тарифа свяжитесь с менеджером:\n👨‍💻 @baur_bkh\nВаш ID: <code>{callback.from_user.id}</code>", parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("show_picklist_"))
 async def process_show_picklist(callback: CallbackQuery):
-    batch_num = callback.data.split("_")[-1]
-    picklist_data = user_pick_lists.get(f"{callback.from_user.id}_{batch_num}")
-
-    if not picklist_data:
-        await callback.answer("⚠️ Данные Листа сборки устарели или не найдены.", show_alert=True)
-        return
-
-    text = f"📦 <b>Лист сборки заказов (Партия №{batch_num}):</b>\n\n"
-    for item, qty in picklist_data.items():
-        text += f"• {item} — <b>{qty} шт.</b>\n"
-
+    picklist_data = user_pick_lists.get(f"{callback.from_user.id}_{callback.data.split('_')[-1]}")
+    if not picklist_data: return await callback.answer("⚠️ Данные Листа сборки устарели.", show_alert=True)
+    text = f"📦 <b>Лист сборки заказов:</b>\n\n"
+    for item, qty in picklist_data.items(): text += f"• {item} — <b>{qty} шт.</b>\n"
     await callback.message.answer(text, parse_mode="HTML")
     await callback.answer()
 
-
 @dp.message(F.text == "🖨 Принтер (XP-365B)")
 async def show_printer_settings(message: types.Message):
-    await message.answer(
-        "🖨 <b>Настройка печати для Xprinter XP-365B:</b>\n\n"
-        "📏 <b>Размер бумаги в драйвере:</b>\n"
-        "• Стандарт Kaspi: <b>75 × 120 мм</b> или <b>100 × 150 мм</b>\n\n"
-        "⚙️ <b>Рекомендуемые параметры в Acrobat / PDF Viewer:</b>\n"
-        "• Масштаб: <b>«Фактический размер» (Actual size)</b> или <b>100%</b>\n"
-        "• Ориентация: <b>Книжная (Portrait)</b>\n"
-        "• Автоповорот: <b>Включен</b>\n\n"
-        "💡 <i>Склеенный файл сохраняет идеальную чёткость штрихкодов!</i>",
-        reply_markup=get_main_keyboard(),
-        parse_mode="HTML"
-    )
-
+    await message.answer("🖨 <b>Настройка печати:</b>\nРазмер 75×120 мм, Масштаб: Фактический размер.", reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 @dp.message(F.text == "💬 Поддержка")
 async def show_support(message: types.Message):
-    await message.answer(
-        "💬 <b>Служба поддержки:</b>\n\n"
-        "Если у вас возникли вопросы по работе бота или оплате подписки:\n"
-        "👨‍💻 Менеджер: @baur_bkh\n"
-        "🕒 Время работы: 09:00 - 21:00",
-        reply_markup=get_main_keyboard(),
-        parse_mode="HTML"
-    )
-
-
-async def send_single_photo_error(user_id: int, message: types.Message):
-    await asyncio.sleep(1.5)
-    await message.answer(
-        "⚠️ <b>Формат не поддерживается!</b>\n\n"
-        "Вы отправили изображение (фото). Бот работает только с <b>PDF-файлами</b> и <b>ZIP-архивами</b> с накладными Kaspi.\n\n"
-        "Пожалуйста, выгрузите накладные из Kaspi Pay в формате <b>.pdf</b> или <b>.zip</b> и отправьте их документом.",
-        parse_mode="HTML"
-    )
-    if user_id in user_photo_tasks:
-        del user_photo_tasks[user_id]
-
+    await message.answer("💬 Служба поддержки:\n👨‍💻 @baur_bkh\n🕒 09:00 - 21:00", reply_markup=get_main_keyboard())
 
 @dp.message(F.photo)
 async def handle_photo(message: types.Message):
-    user_id = message.from_user.id
-    if user_id in user_photo_tasks:
-        user_photo_tasks[user_id].cancel()
+    await message.answer("⚠️ Бот работает только с PDF и ZIP файлами. Фотографии не поддерживаются.")
 
-    user_photo_tasks[user_id] = asyncio.create_task(send_single_photo_error(user_id, message))
-
-
-# ОСНОВНОЙ ПРОЦЕСС ОБРАБОТКИ
+# --- ОСНОВНОЙ ПРОЦЕСС ОБРАБОТКИ ---
 async def process_user_files(user_id: int, message: types.Message):
     await asyncio.sleep(2)
-
     files_list = user_files_buffer.pop(user_id, [])
-    if not files_list:
-        return
+    if not files_list: return
 
     user_data = get_or_create_user(user_id, message.from_user.username)
     duplicate_enabled = user_data["duplicate_mode"]
-
-    valid_files = []
-    invalid_found = False
-
-    for doc in files_list:
-        ext = os.path.splitext(doc.file_name)[1].lower() if doc.file_name else ""
-        if ext in [".pdf", ".zip"]:
-            valid_files.append(doc)
-        else:
-            invalid_found = True
-
-    if invalid_found and not valid_files:
-        await message.answer(
-            "❌ <b>Ошибка формата!</b>\n\n"
-            "Вы отправили неподдерживаемый файл.\n"
-            "Пожалуйста, отправляйте только файлы <b>.pdf</b> или <b>.zip</b> архивы.",
-            parse_mode="HTML"
-        )
-        return
+    paper_format = user_data["paper_format"]
+    valid_files = [doc for doc in files_list if (os.path.splitext(doc.file_name)[1].lower() if doc.file_name else "") in [".pdf", ".zip"]]
+    
+    if not valid_files:
+        return await message.answer("❌ Ошибка формата! Отправляйте .pdf или .zip", parse_mode="HTML")
 
     user_dir = f"./temp_{user_id}"
     os.makedirs(user_dir, exist_ok=True)
-
-    status_msg = await message.answer(f"📥 Скачиваю и обрабатываю {len(valid_files)} фaйл(а/ов)...")
-
+    status_msg = await message.answer(f"📥 Обработка {len(valid_files)} файл(ов)...")
     pdf_files = []
 
     try:
         current_batch_number = user_data["user_batch_counter"]
-
         for idx, doc in enumerate(valid_files):
             file_info = await bot.get_file(doc.file_id)
-            
             ext = os.path.splitext(doc.file_name)[1].lower()
-            safe_name = f"file_{idx}{ext}"
-            downloaded_path = os.path.join(user_dir, safe_name)
-            
+            downloaded_path = os.path.join(user_dir, f"file_{idx}{ext}")
             await bot.download_file(file_info.file_path, destination=downloaded_path)
 
             if ext == ".zip":
                 extract_dir = os.path.join(user_dir, f"ext_{idx}")
                 os.makedirs(extract_dir, exist_ok=True)
-                with zipfile.ZipFile(downloaded_path, "r") as zip_ref:
-                    zip_ref.extractall(extract_dir)
-
-                extracted_pdfs = []
+                with zipfile.ZipFile(downloaded_path, "r") as zip_ref: zip_ref.extractall(extract_dir)
                 for root, _, files in os.walk(extract_dir):
-                    for f in files:
-                        if f.lower().endswith(".pdf"):
-                            extracted_pdfs.append(os.path.join(root, f))
-                
-                extracted_pdfs.sort()
-                pdf_files.extend(extracted_pdfs)
-
+                    pdf_files.extend([os.path.join(root, f) for f in files if f.lower().endswith(".pdf")])
             elif ext == ".pdf":
                 pdf_files.append(downloaded_path)
 
         if not pdf_files:
-            await status_msg.edit_text("❌ В отправленных файлах не найдено PDF-накладных.")
             shutil.rmtree(user_dir, ignore_errors=True)
-            return
+            return await status_msg.edit_text("❌ В файлах нет PDF.")
 
         grouped_pages, picklist_data = parse_and_sort_pdf_pages(pdf_files)
         total_orders = sum(len(pages) for pages in grouped_pages.values())
         
-        already_used = user_data["used_today"]
-        max_allowed = user_data["max_allowed"]
-        has_active_sub = user_data["has_active_sub"]
-
-        if not has_active_sub and (already_used + total_orders > max_allowed):
-            remains = max(0, max_allowed - already_used)
-            await status_msg.edit_text(
-                f"🛑 <b>Превышен дневной лимит!</b>\n\n"
-                f"Вы пытаетесь обработать: <code>{total_orders} шт.</code>\n"
-                f"Ваш остаток на сегодня: <code>{remains} шт.</code> (Обработано сегодня: {already_used}/{max_allowed})\n\n"
-                f"Для снятия ограничений выберите подходящий тариф через кнопку «⭐ Тарифы и подписка».\n"
-                f"📞 Обратитесь к менеджеру: @baur_bkh",
-                parse_mode="HTML"
-            )
+        if not user_data["has_active_sub"] and (user_data["used_today"] + total_orders > user_data["max_allowed"]):
             shutil.rmtree(user_dir, ignore_errors=True)
-            return
+            return await status_msg.edit_text("🛑 Превышен лимит! Оформите подписку.")
 
         now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
-
-        await status_msg.edit_text(f"⚙️ Подготовка файла: ПАРТИЯ №{current_batch_number} ({total_orders} накладных)...")
-
-        if picklist_data:
-            user_pick_lists[f"{user_id}_{current_batch_number}"] = picklist_data
+        await status_msg.edit_text(f"⚙️ Подготовка: ПАРТИЯ №{current_batch_number} ({total_orders} заказов)...")
+        if picklist_data: user_pick_lists[f"{user_id}_{current_batch_number}"] = picklist_data
 
         writer = PdfWriter()
-
         cover_stream = create_cover_page(current_batch_number, total_orders, now_str)
         cover_reader = PdfReader(cover_stream)
-        writer.add_page(cover_reader.pages[0])
-
+        
         current_global_idx = 1
         current_page_counter = 2
         delivery_summary_text = ""
+        processed_pages_stream = []
+
+        # Форматы А4 обрабатываем через буфер
+        is_a4_grid = paper_format in ["a4_4in1", "a4_8in1", "a4_9in1"]
+        
+        if is_a4_grid:
+            processed_pages_stream.append(cover_reader.pages[0])
+        else:
+            writer.add_page(cover_reader.pages[0])
 
         for group_title, pages in grouped_pages.items():
-            if not pages:
-                continue
-
+            if not pages: continue
+            
             group_cover_stream = create_delivery_group_cover(group_title, len(pages))
             group_cover_reader = PdfReader(group_cover_stream)
-            writer.add_page(group_cover_reader.pages[0])
+            
+            if is_a4_grid:
+                processed_pages_stream.append(group_cover_reader.pages[0])
+            else:
+                writer.add_page(group_cover_reader.pages[0])
             
             start_page = current_page_counter + 1
             current_page_counter += 1
 
             for page in pages:
-                box = page.mediabox
-                width = float(box.width)
-                height = float(box.height)
-                rotation = page.get('/Rotate', 0)
-                
-                if rotation in (90, 270):
-                    width, height = height, width
+                if paper_format == "a4_crop_thermal":
+                    page = crop_a4_top_left_to_thermal(page)
 
+                width, height = float(page.mediabox.width), float(page.mediabox.height)
+                if page.get('/Rotate', 0) in (90, 270): width, height = height, width
                 is_landscape = width > height
 
                 stamp_stream = create_number_stamp(current_global_idx, total_orders, is_landscape=is_landscape)
-                stamp_reader = PdfReader(stamp_stream)
-                page.merge_page(stamp_reader.pages[0])
+                page.merge_page(PdfReader(stamp_stream).pages[0])
 
-                if is_landscape:
-                    page.rotate(90)
+                if is_landscape: page.rotate(90)
 
-                writer.add_page(page)
-                current_page_counter += 1
-
-                if duplicate_enabled:
+                if is_a4_grid:
+                    processed_pages_stream.append(page)
+                    if duplicate_enabled: processed_pages_stream.append(page)
+                else:
                     writer.add_page(page)
                     current_page_counter += 1
+                    if duplicate_enabled:
+                        writer.add_page(page)
+                        current_page_counter += 1
 
                 current_global_idx += 1
 
             end_page = current_page_counter - 1
-            delivery_summary_text += f"• {group_title}: <b>{len(pages)} шт.</b> <i>(стр. {start_page}–{end_page})</i>\n"
+            delivery_summary_text += f"• {group_title}: <b>{len(pages)} шт.</b>\n"
+
+        if is_a4_grid:
+            mode_type = paper_format.replace("a4_", "")
+            n_up_writer = merge_pages_n_up(processed_pages_stream, mode=mode_type)
+            for page_n in n_up_writer.pages: writer.add_page(page_n)
 
         output_pdf_path = os.path.join(user_dir, f"ПАРТИЯ_№{current_batch_number}.pdf")
-        with open(output_pdf_path, "wb") as f_out:
-            writer.write(f_out)
+        with open(output_pdf_path, "wb") as f_out: writer.write(f_out)
 
         update_user_usage_and_batch(user_id, total_orders)
-        new_used = already_used + total_orders
-
-        saved_minutes_total = total_orders * 0.5
-        saved_minutes = int(saved_minutes_total)
-        saved_seconds = int((saved_minutes_total - saved_minutes) * 60)
-
-        if saved_minutes > 0 and saved_seconds > 0:
-            time_str = f"~{saved_minutes} мин {saved_seconds} сек"
-        elif saved_minutes > 0:
-            time_str = f"~{saved_minutes} мин"
-        else:
-            time_str = f"~{saved_seconds} сек"
-
-        mode_note = "\n📄 <i>Режим дублирования этикеток: ВКЛ (по 2 шт)</i>" if duplicate_enabled else ""
-        sub_text = "♾ <i>Безлимитная подписка</i>" if has_active_sub else f"<code>{new_used} из {max_allowed} шт.</code>"
+        
+        fmt_notes = {
+            "thermal": "🏷 Термопринтер",
+            "a4_crop_thermal": "✂️ Обрезка А4",
+            "a4_4in1": "📄 4 на 1 лист (А4)",
+            "a4_8in1": "📄 8 на 1 лист (А4)",
+            "a4_9in1": "📄 9 на 1 лист (А4)"
+        }
 
         summary_msg = (
             f"✅ <b>ПАРТИЯ №{current_batch_number} сформирована!</b>\n\n"
-            f"🚚 <b>Сортировка по службам доставки:</b>\n"
-            f"{delivery_summary_text}\n"
-            f"📦 <b>Всего накладных:</b> <code>{total_orders} шт.</code>{mode_note}\n"
-            f"⏱ <b>Сэкономлено времени:</b> <code>{time_str}</code>\n\n"
-            f"📅 <b>Дата/Время:</b> <code>{now_str}</code>\n"
-            f"📊 <b>Использовано лимита:</b> {sub_text}\n\n"
-            f"💡 <i>Все накладные сгруппированы по курьерам! Нажмите «Показать Лист сборки» ниже.</i>"
+            f"🚚 <b>Службы доставки:</b>\n{delivery_summary_text}\n"
+            f"📦 <b>Заказов:</b> <code>{total_orders} шт.</code>\n"
+            f"🖨 <b>Формат бумаги:</b> {fmt_notes.get(paper_format, '')}\n"
+            f"💡 <i>Нажмите «Показать Лист сборки» ниже.</i>"
         )
 
         await status_msg.delete()
-        
-        output_file = types.FSInputFile(output_pdf_path)
         await message.answer_document(
-            document=output_file,
+            document=types.FSInputFile(output_pdf_path),
             caption=summary_msg,
             reply_markup=get_batch_result_keyboard(current_batch_number),
             parse_mode="HTML"
         )
 
     except Exception as e:
-        await status_msg.edit_text(f"❌ Произошла ошибка при обработке: {e}")
-
+        await status_msg.edit_text(f"❌ Ошибка при обработке: {e}")
     finally:
         shutil.rmtree(user_dir, ignore_errors=True)
-        if user_id in user_tasks:
-            del user_tasks[user_id]
+        if user_id in user_tasks: del user_tasks[user_id]
 
 
 @dp.message(F.document)
 async def handle_document(message: types.Message):
     user_id = message.from_user.id
     user_files_buffer[user_id].append(message.document)
-
-    if user_id in user_tasks:
-        user_tasks[user_id].cancel()
-
+    if user_id in user_tasks: user_tasks[user_id].cancel()
     user_tasks[user_id] = asyncio.create_task(process_user_files(user_id, message))
 
-
 async def main():
-    print("🚀 Бот @ksp_print запущен с поддержкой /stats, /broadcast и фоновой проверкой подписок!")
-    # Запуск фоновой задачи для автоматической проверки подписок
+    print("🚀 Бот @ksp_print с улучшенной раскладкой на А4 запущен!")
     asyncio.create_task(check_subscription_expirations())
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -74,13 +74,23 @@ def init_db():
         )
     """)
     
-    # Таблица истории обработанных партий для помесячной статистики
+    # Таблица истории обработанных партий для статистики
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS batch_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             orders_count INTEGER,
             processed_at TEXT
+        )
+    """)
+
+    # Таблица для отслеживания отправленных уведомлений о подписке
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sub_notifications (
+            user_id INTEGER,
+            notify_type TEXT,
+            sent_date TEXT,
+            PRIMARY KEY (user_id, notify_type, sent_date)
         )
     """)
     
@@ -195,7 +205,6 @@ def update_user_usage_and_batch(user_id: int, added_count: int):
     cursor = conn.cursor()
     now_str = datetime.now().isoformat()
     
-    # Обновление счетчиков пользователя
     cursor.execute("""
         UPDATE users 
         SET used_today = used_today + ?, 
@@ -204,7 +213,6 @@ def update_user_usage_and_batch(user_id: int, added_count: int):
         WHERE user_id = ?
     """, (added_count, added_count, user_id))
     
-    # Запись в историю для точной месячной статистики
     cursor.execute("""
         INSERT INTO batch_history (user_id, orders_count, processed_at)
         VALUES (?, ?, ?)
@@ -233,7 +241,6 @@ def get_monthly_statistics(user_id: int):
     monthly_orders = row[0] if row[0] else 0
     batches_count = row[1] if row[1] else 0
     
-    # Расчет сэкономленного времени (~30 секунд на заказ)
     saved_minutes_total = monthly_orders * 0.5
     hours = int(saved_minutes_total // 60)
     minutes = int(saved_minutes_total % 60)
@@ -272,10 +279,6 @@ def detect_delivery_type(text: str) -> str:
 
 
 def parse_and_sort_pdf_pages(pdf_files: list):
-    """
-    Разбирает PDF-файлы, группирует их страницы по типам доставки 
-    и формирует единый Лист сборки.
-    """
     grouped_pages = defaultdict(list)
     items_count = defaultdict(int)
     
@@ -287,7 +290,6 @@ def parse_and_sort_pdf_pages(pdf_files: list):
                 delivery_type = detect_delivery_type(text)
                 grouped_pages[delivery_type].append(page)
                 
-                # Поиск наименований товаров и количества в накладных
                 lines = text.split('\n')
                 for line in lines:
                     match = re.search(r'(.+?)\s+(\d+)\s*(?:шт|ед|\b)', line, re.IGNORECASE)
@@ -435,7 +437,6 @@ def create_cover_page(batch_number: int, total_orders: int, date_str: str) -> io
 
 
 def create_delivery_group_cover(group_title: str, count: int) -> io.BytesIO:
-    """Генерация разделительной титульной страницы для службы доставки."""
     packet = io.BytesIO()
     c = canvas.Canvas(packet, pagesize=(212, 340))
     
@@ -478,7 +479,7 @@ def create_number_stamp(current_idx: int, total_orders: int, is_landscape: bool 
     return packet
 
 
-# --- ОБРАБОТЧИК СТАТИСТИКИ ---
+# --- ОБРАБОТЧИК СТАТИСТИКИ КЛИЕНТА ---
 @dp.message(F.text == "📊 Статистика за месяц")
 async def show_monthly_stats(message: types.Message):
     user_id = message.from_user.id
@@ -488,8 +489,6 @@ async def show_monthly_stats(message: types.Message):
     if stats["hours"] > 0:
         time_saved_str += f"<b>{stats['hours']} ч.</b> "
     time_saved_str += f"<b>{stats['minutes']} мин.</b>"
-    
-    month_name = datetime.now().strftime("%B")
     
     await message.answer(
         f"📊 <b>Ваша статистика продаж за текущий месяц:</b>\n\n"
@@ -502,7 +501,191 @@ async def show_monthly_stats(message: types.Message):
     )
 
 
-# --- АДМИН-КОМАНДЫ ---
+# --- ⚙️ НОВЫЕ АДМИН-ФУНКЦИИ (STATS, BROADCAST, NOTIFICATIONS) ---
+
+# 1. ОБЩАЯ СТАТИСТИКА БОТА ДЛЯ ВЛАДЕЛЬЦА
+@dp.message(Command("stats"))
+async def admin_bot_stats(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    conn = sqlite3.connect("db.sqlite3")
+    cursor = conn.cursor()
+
+    # Всего пользователей
+    cursor.execute("SELECT COUNT(user_id) FROM users")
+    total_users = cursor.fetchone()[0] or 0
+
+    # Активных подписок
+    today_str = date.today().isoformat()
+    cursor.execute(
+        "SELECT COUNT(user_id) FROM users WHERE is_unlimited = 1 OR (subscription_expires IS NOT NULL AND subscription_expires >= ?)",
+        (today_str,)
+    )
+    active_subs = cursor.fetchone()[0] or 0
+
+    # Заказов за сегодня
+    cursor.execute("SELECT SUM(orders_count) FROM batch_history WHERE processed_at >= ?", (today_str,))
+    orders_today = cursor.fetchone()[0] or 0
+
+    # Заказов за 7 дней
+    seven_days_ago = (date.today() - timedelta(days=7)).isoformat()
+    cursor.execute("SELECT SUM(orders_count) FROM batch_history WHERE processed_at >= ?", (seven_days_ago,))
+    orders_7days = cursor.fetchone()[0] or 0
+
+    # Заказов за текущий месяц
+    first_day_month = date.today().replace(day=1).isoformat()
+    cursor.execute("SELECT SUM(orders_count) FROM batch_history WHERE processed_at >= ?", (first_day_month,))
+    orders_month = cursor.fetchone()[0] or 0
+
+    conn.close()
+
+    await message.answer(
+        f"📊 <b>Общая статистика бота @ksp_print:</b>\n\n"
+        f"👥 <b>Пользователей всего:</b> <code>{total_users} чел.</code>\n"
+        f"👑 <b>Активных подписок:</b> <code>{active_subs}</code>\n\n"
+        f"📈 <b>Обработка заказов (накладных):</b>\n"
+        f"• За сегодня: <code>{orders_today} шт.</code>\n"
+        f"• За 7 дней: <code>{orders_7days} шт.</code>\n"
+        f"• За текущий месяц: <code>{orders_month} шт.</code>",
+        parse_mode="HTML"
+    )
+
+
+# 2. МАССОВАЯ РАССЫЛКА ДЛЯ ВСЕХ ПОЛЬЗОВАТЕЛЕЙ
+@dp.message(Command("broadcast"))
+async def admin_broadcast(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    text_to_send = message.text.replace("/broadcast", "").strip()
+    if not text_to_send:
+        await message.answer(
+            "📢 <b>Использование рассылки:</b>\n\n"
+            "<code>/broadcast Ваш текст анонса или новости</code>\n\n"
+            "<i>Поддерживается форматирование HTML (жирный, ссылки и т.д.)</i>",
+            parse_mode="HTML"
+        )
+        return
+
+    conn = sqlite3.connect("db.sqlite3")
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM users")
+    users = cursor.fetchall()
+    conn.close()
+
+    status_msg = await message.answer(f"🚀 Начинаю рассылку для {len(users)} пользователей...")
+
+    success_count = 0
+    fail_count = 0
+
+    for u in users:
+        uid = u[0]
+        try:
+            await bot.send_message(uid, text_to_send, parse_mode="HTML", disable_web_page_preview=True)
+            success_count += 1
+            await asyncio.sleep(0.05)  # Защита от лимитов Telegram API
+        except Exception:
+            fail_count += 1
+
+    await status_msg.edit_text(
+        f"✅ <b>Рассылка завершена!</b>\n\n"
+        f"📥 Успешно доставлено: <code>{success_count}</code>\n"
+        f"❌ Ошибок (заблокировали бота): <code>{fail_count}</code>",
+        parse_mode="HTML"
+    )
+
+
+# 3. АВТОМАТИЧЕСКИЕ УВЕДОМЛЕНИЯ О ЗАВЕРШЕНИИ ПОДПИСКИ (3 ДНЯ И 1 ДЕНЬ)
+async def check_subscription_expirations():
+    """Фоновая задача, ежедневно проверяющая истекающие подписки."""
+    while True:
+        try:
+            today = date.today()
+            today_str = today.isoformat()
+            day_3_str = (today + timedelta(days=3)).isoformat()
+            day_1_str = (today + timedelta(days=1)).isoformat()
+
+            conn = sqlite3.connect("db.sqlite3")
+            cursor = conn.cursor()
+
+            renew_keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="⭐ Продлить подписку", callback_data="category_subscriptions")],
+                    [InlineKeyboardButton(text="💬 Менеджер", url="https://t.me/baur_bkh")]
+                ]
+            )
+
+            # Напоминание за 3 дня
+            cursor.execute("""
+                SELECT user_id FROM users 
+                WHERE is_unlimited = 0 AND subscription_expires = ?
+            """, (day_3_str,))
+            users_3d = cursor.fetchall()
+
+            for (uid,) in users_3d:
+                cursor.execute(
+                    "SELECT 1 FROM sub_notifications WHERE user_id = ? AND notify_type = '3d' AND sent_date = ?",
+                    (uid, today_str)
+                )
+                if not cursor.fetchone():
+                    try:
+                        await bot.send_message(
+                            uid,
+                            f"⏰ <b>Напоминание о подписке KaspiPrint!</b>\n\n"
+                            f"Ваша безлимитная подписка завершится через <b>3 дня</b> ({day_3_str}).\n\n"
+                            f"Продлите подписку заранее, чтобы не терять доступ к авто-сортировке курьеров и Листу сборки!",
+                            reply_markup=renew_keyboard,
+                            parse_mode="HTML"
+                        )
+                        cursor.execute(
+                            "INSERT INTO sub_notifications (user_id, notify_type, sent_date) VALUES (?, '3d', ?)",
+                            (uid, today_str)
+                        )
+                        conn.commit()
+                    except Exception:
+                        pass
+
+            # Напоминание за 1 день
+            cursor.execute("""
+                SELECT user_id FROM users 
+                WHERE is_unlimited = 0 AND subscription_expires = ?
+            """, (day_1_str,))
+            users_1d = cursor.fetchall()
+
+            for (uid,) in users_1d:
+                cursor.execute(
+                    "SELECT 1 FROM sub_notifications WHERE user_id = ? AND notify_type = '1d' AND sent_date = ?",
+                    (uid, today_str)
+                )
+                if not cursor.fetchone():
+                    try:
+                        await bot.send_message(
+                            uid,
+                            f"⚠️ <b>Подписка истекает завтра!</b>\n\n"
+                            f"Завтра ({day_1_str}) ваш доступ к премиум-функциям будет приостановлен.\n\n"
+                            f"Нажмите кнопку ниже, чтобы продлить доступ в 1 клик 👇",
+                            reply_markup=renew_keyboard,
+                            parse_mode="HTML"
+                        )
+                        cursor.execute(
+                            "INSERT INTO sub_notifications (user_id, notify_type, sent_date) VALUES (?, '1d', ?)",
+                            (uid, today_str)
+                        )
+                        conn.commit()
+                    except Exception:
+                        pass
+
+            conn.close()
+
+        except Exception as e:
+            print(f"Ошибка в фоновом планировщике подписок: {e}")
+
+        # Проверка 1 раз в сутки (86400 секунд)
+        await asyncio.sleep(86400)
+
+
+# --- СТАРАЯ АДМИН-ПАНЕЛЬ (/sub, /ksprnt) ---
 @dp.message(Command("sub"))
 async def admin_manage_subscriptions(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -998,7 +1181,6 @@ async def process_user_files(user_id: int, message: types.Message):
             shutil.rmtree(user_dir, ignore_errors=True)
             return
 
-        # Парсинг и группировка страниц по службам доставки
         grouped_pages, picklist_data = parse_and_sort_pdf_pages(pdf_files)
         total_orders = sum(len(pages) for pages in grouped_pages.values())
         
@@ -1028,21 +1210,18 @@ async def process_user_files(user_id: int, message: types.Message):
 
         writer = PdfWriter()
 
-        # Титульная обложка партии
         cover_stream = create_cover_page(current_batch_number, total_orders, now_str)
         cover_reader = PdfReader(cover_stream)
         writer.add_page(cover_reader.pages[0])
 
         current_global_idx = 1
-        current_page_counter = 2  # Учитываем первую обложку
+        current_page_counter = 2
         delivery_summary_text = ""
 
-        # Проходим по каждой группе доставки
         for group_title, pages in grouped_pages.items():
             if not pages:
                 continue
 
-            # Добавляем обложку-разделитель для группы
             group_cover_stream = create_delivery_group_cover(group_title, len(pages))
             group_cover_reader = PdfReader(group_cover_stream)
             writer.add_page(group_cover_reader.pages[0])
@@ -1143,7 +1322,9 @@ async def handle_document(message: types.Message):
 
 
 async def main():
-    print("🚀 Бот @ksp_print с поддержкой авто-сортировки и статистики запущен!")
+    print("🚀 Бот @ksp_print запущен с поддержкой /stats, /broadcast и фоновой проверкой подписок!")
+    # Запуск фоновой задачи для автоматической проверки подписок
+    asyncio.create_task(check_subscription_expirations())
     await dp.start_polling(bot)
 
 

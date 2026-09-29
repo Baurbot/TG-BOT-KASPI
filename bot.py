@@ -496,51 +496,7 @@ def get_subscriptions_keyboard() -> InlineKeyboardMarkup:
         ]
     )
 
-# --- ГЕНЕРАЦИЯ СТРАНИЦ И ОБЛОЖЕК В PDF ---
-def create_cover_page(batch_number: int, total_orders: int, date_str: str) -> io.BytesIO:
-    packet = io.BytesIO()
-    c = canvas.Canvas(packet, pagesize=(212, 340))
-    c.setFillColor(HexColor("#7A0000"))
-    c.roundRect(10, 260, 192, 65, 12, fill=True, stroke=False)
-    c.setFillColor(HexColor("#FFFFFF"))
-    c.setFont(FONT_NAME, 18)
-    c.drawCentredString(106, 287, "KaspiPrint")
-    c.setFillColor(HexColor("#7A0000"))
-    c.roundRect(25, 205, 162, 28, 14, fill=True, stroke=False)
-    c.setFillColor(HexColor("#FFFFFF"))
-    c.setFont(FONT_NAME, 9)
-    c.drawCentredString(106, 214, f"ПАРТИЯ №{batch_number} сформирована!")
-    c.setFillColor(HexColor("#0A0A0A"))
-    c.roundRect(15, 115, 182, 70, 10, fill=True, stroke=False)
-    c.setFillColor(HexColor("#FFFFFF"))
-    c.setFont(FONT_NAME, 9)
-    c.drawString(28, 158, f"Дата/Время: {date_str}")
-    c.drawString(28, 132, f"ВСЕГО ЗАКАЗОВ В ПАРТИИ: {total_orders} ШТ.")
-    c.setFillColor(HexColor("#444444"))
-    c.setFont(FONT_NAME, 6)
-    c.drawCentredString(106, 35, "Печатайте файл и собирайте заказы по порядку!")
-    c.save()
-    packet.seek(0)
-    return packet
-
-def create_delivery_group_cover(group_title: str, count: int) -> io.BytesIO:
-    packet = io.BytesIO()
-    c = canvas.Canvas(packet, pagesize=(212, 340))
-    c.setFillColor(HexColor("#0A0A0A"))
-    c.rect(0, 0, 212, 340, fill=True, stroke=False)
-    c.setFillColor(HexColor("#FF3B30"))
-    c.roundRect(10, 200, 192, 100, 10, fill=True, stroke=False)
-    c.setFillColor(HexColor("#FFFFFF"))
-    c.setFont(FONT_NAME, 10)
-    c.drawCentredString(106, 265, group_title.upper())
-    c.setFont(FONT_NAME, 14)
-    c.drawCentredString(106, 230, f"ЗАКАЗОВ: {count} ШТ.")
-    c.setFont(FONT_NAME, 8)
-    c.drawCentredString(106, 120, "Далее идут накладные этой категории")
-    c.save()
-    packet.seek(0)
-    return packet
-
+# --- ГЕНЕРАЦИЯ ШТАМПОВ НУМЕРАЦИИ (БЕЗ ОБЛОЖЕК) ---
 def create_number_stamp(current_idx: int, total_orders: int, is_landscape: bool = False) -> io.BytesIO:
     packet = io.BytesIO()
     pagesize = (340, 212) if is_landscape else (212, 340)
@@ -875,36 +831,17 @@ async def process_user_files(user_id: int, message: types.Message):
         if picklist_data: user_pick_lists[f"{user_id}_{current_batch_number}"] = picklist_data
 
         writer = PdfWriter()
-        cover_stream = create_cover_page(current_batch_number, total_orders, now_str)
-        cover_reader = PdfReader(cover_stream)
         
         current_global_idx = 1
-        current_page_counter = 2
         delivery_summary_text = ""
         processed_pages_stream = []
 
         # Форматы А4 обрабатываем через буфер
         is_a4_grid = paper_format in ["a4_4in1", "a4_8in1", "a4_9in1"]
         
-        if is_a4_grid:
-            processed_pages_stream.append(cover_reader.pages[0])
-        else:
-            writer.add_page(cover_reader.pages[0])
-
         for group_title, pages in grouped_pages.items():
             if not pages: continue
             
-            group_cover_stream = create_delivery_group_cover(group_title, len(pages))
-            group_cover_reader = PdfReader(group_cover_stream)
-            
-            if is_a4_grid:
-                processed_pages_stream.append(group_cover_reader.pages[0])
-            else:
-                writer.add_page(group_cover_reader.pages[0])
-            
-            start_page = current_page_counter + 1
-            current_page_counter += 1
-
             for page in pages:
                 if paper_format == "a4_crop_thermal":
                     page = crop_a4_top_left_to_thermal(page)
@@ -923,14 +860,11 @@ async def process_user_files(user_id: int, message: types.Message):
                     if duplicate_enabled: processed_pages_stream.append(page)
                 else:
                     writer.add_page(page)
-                    current_page_counter += 1
                     if duplicate_enabled:
                         writer.add_page(page)
-                        current_page_counter += 1
 
                 current_global_idx += 1
 
-            end_page = current_page_counter - 1
             delivery_summary_text += f"• {group_title}: <b>{len(pages)} шт.</b>\n"
 
         if is_a4_grid:

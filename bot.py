@@ -19,9 +19,12 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-BOT_TOKEN = "8563063962:AAE8JCad_gceirSwOYM2162blqq_bD54MkQ"
+BOT_TOKEN = "8563063962:AAHX23We5PeEvnxFypz24w2fmlshCXMJFLg"
 ADMIN_ID = 1260202941  # Ваш Telegram ID
 CHANNEL_LINK = "https://t.me/ksp_print"
+
+STORAGE_DIR = "storage_batches"
+os.makedirs(STORAGE_DIR, exist_ok=True)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -67,6 +70,7 @@ def init_db():
             user_batch_counter INTEGER DEFAULT 1,
             duplicate_mode INTEGER DEFAULT 0,
             paper_format TEXT DEFAULT 'thermal',
+            sort_mode TEXT DEFAULT 'city',
             referrer_id INTEGER DEFAULT NULL,
             referrals_count INTEGER DEFAULT 0,
             subscription_expires TEXT DEFAULT NULL,
@@ -80,7 +84,8 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             orders_count INTEGER,
-            processed_at TEXT
+            processed_at TEXT,
+            file_path TEXT
         )
     """)
 
@@ -102,6 +107,8 @@ def init_db():
         cursor.execute("ALTER TABLE users ADD COLUMN duplicate_mode INTEGER DEFAULT 0")
     if "paper_format" not in columns:
         cursor.execute("ALTER TABLE users ADD COLUMN paper_format TEXT DEFAULT 'thermal'")
+    if "sort_mode" not in columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN sort_mode TEXT DEFAULT 'city'")
     if "referrer_id" not in columns:
         cursor.execute("ALTER TABLE users ADD COLUMN referrer_id INTEGER DEFAULT NULL")
     if "referrals_count" not in columns:
@@ -112,6 +119,11 @@ def init_db():
         cursor.execute("ALTER TABLE users ADD COLUMN is_unlimited INTEGER DEFAULT 0")
     if "total_orders_count" not in columns:
         cursor.execute("ALTER TABLE users ADD COLUMN total_orders_count INTEGER DEFAULT 0")
+
+    cursor.execute("PRAGMA table_info(batch_history)")
+    batch_columns = [column[1] for column in cursor.fetchall()]
+    if "file_path" not in batch_columns:
+        cursor.execute("ALTER TABLE batch_history ADD COLUMN file_path TEXT")
         
     conn.commit()
     conn.close()
@@ -142,8 +154,8 @@ def get_or_create_user(user_id: int, username: str = None, referrer_id: int = No
         cursor.execute(
             """INSERT INTO users 
                (user_id, username, daily_limit, bonus_limit, used_today, last_active_date, 
-                user_batch_counter, duplicate_mode, paper_format, referrer_id, referrals_count, subscription_expires, is_unlimited, total_orders_count) 
-               VALUES (?, ?, 35, 0, 0, ?, 1, 0, 'thermal', ?, 0, NULL, 0, 0)""",
+                user_batch_counter, duplicate_mode, paper_format, sort_mode, referrer_id, referrals_count, subscription_expires, is_unlimited, total_orders_count) 
+               VALUES (?, ?, 35, 0, 0, ?, 1, 0, 'thermal', 'city', ?, 0, NULL, 0, 0)""",
             (user_id, username, today_str, valid_referrer)
         )
         conn.commit()
@@ -202,7 +214,7 @@ def get_or_create_user(user_id: int, username: str = None, referrer_id: int = No
     }
 
 
-def update_user_usage_and_batch(user_id: int, added_count: int):
+def update_user_usage_and_batch(user_id: int, added_count: int, file_path: str) -> int:
     conn = sqlite3.connect("db.sqlite3")
     cursor = conn.cursor()
     now_str = datetime.now().isoformat()
@@ -216,12 +228,15 @@ def update_user_usage_and_batch(user_id: int, added_count: int):
     """, (added_count, added_count, user_id))
     
     cursor.execute("""
-        INSERT INTO batch_history (user_id, orders_count, processed_at)
-        VALUES (?, ?, ?)
-    """, (user_id, added_count, now_str))
+        INSERT INTO batch_history (user_id, orders_count, processed_at, file_path)
+        VALUES (?, ?, ?, ?)
+    """, (user_id, added_count, now_str, file_path))
+    
+    batch_db_id = cursor.lastrowid
     
     conn.commit()
     conn.close()
+    return batch_db_id
 
 
 def set_user_paper_format(user_id: int, paper_format: str):
@@ -352,18 +367,9 @@ def crop_a4_top_left_to_thermal(page):
     return page
 
 
-def detect_delivery_type(text: str) -> str:
-    text_lower = text.lower()
-    if "express" in text_lower or "яндекс" in text_lower or "достависта" in text_lower:
-        return "⚡️ Kaspi Express / Яндекс"
-    elif "самовывоз" in text_lower:
-        return "🏬 Самовывоз"
-    else:
-        return "📦 Kaspi Доставка (ПВЗ/Курьер)"
-
-
-def parse_and_sort_pdf_pages(pdf_files: list):
-    grouped_pages = defaultdict(list)
+# --- ОБРАБОТКА И ИЗВЛЕЧЕНИЕ ТОВАРОВ БЕЗ СОРТИРОВКИ ---
+def parse_pdf_pages_without_sorting(pdf_files: list):
+    parsed_orders = []
     items_count = defaultdict(int)
     
     for pdf_path in pdf_files:
@@ -371,22 +377,33 @@ def parse_and_sort_pdf_pages(pdf_files: list):
             reader = PdfReader(pdf_path)
             for page in reader.pages:
                 text = page.extract_text() or ""
-                delivery_type = detect_delivery_type(text)
-                grouped_pages[delivery_type].append(page)
+                
+                parsed_orders.append({
+                    "page": page
+                })
                 
                 lines = text.split('\n')
                 for line in lines:
                     match = re.search(r'(.+?)\s+(\d+)\s*(?:шт|ед|\b)', line, re.IGNORECASE)
                     if match:
                         item_name = match.group(1).strip()
-                        if any(kw in item_name.lower() for kw in ["наименование", "заказ", "клиент", "итого", "номер"]):
+                        
+                        item_name = re.sub(r'\b\d{2,}\b', '', item_name).strip()
+                        item_name = re.sub(r'[\d\.,]+', '', item_name).strip()
+                        item_name = re.sub(r'\s+', ' ', item_name)
+                        
+                        if not item_name or len(item_name) < 2:
                             continue
+                            
+                        if any(kw in item_name.lower() for kw in ["наименование", "заказ", "клиент", "итого", "номер", "сумма", "цена", "код", "тенге", "₸", "kaspi"]):
+                            continue
+                            
                         qty = int(match.group(2))
-                        if len(item_name) > 2:
-                            items_count[item_name] += qty
+                        items_count[item_name] += qty
         except Exception as e:
             print(f"Ошибка при извлечении текста из {pdf_path}: {e}")
             
+    grouped_pages = {"📦 Все заказы": [ord_obj["page"] for ord_obj in parsed_orders]}
     return grouped_pages, dict(items_count)
 
 
@@ -394,6 +411,7 @@ def parse_and_sort_pdf_pages(pdf_files: list):
 def get_main_keyboard():
     builder = ReplyKeyboardBuilder()
     builder.button(text="🚀 Старт бота")
+    builder.button(text="📦 Мои партии")
     builder.button(text="📊 Статистика за месяц")
     builder.button(text="⚙️ Настройки")
     builder.button(text="🎁 Приведи друга")
@@ -402,15 +420,16 @@ def get_main_keyboard():
     builder.button(text="🖨 Принтер (XP-365B)")
     builder.button(text="📢 Наш канал / Отзывы")
     builder.button(text="💬 Поддержка")
-    builder.adjust(2, 2, 2, 2, 1)
+    builder.adjust(2, 2, 2, 2, 2, 1)
     return builder.as_markup(resize_keyboard=True)
 
 
-def get_batch_result_keyboard(batch_num: int):
+def get_batch_result_keyboard(batch_db_id: int, batch_num: int):
     builder = InlineKeyboardBuilder()
     builder.button(text="📦 Показать Лист сборки", callback_data=f"show_picklist_{batch_num}")
+    builder.button(text="📥 Повторно скачать", callback_data=f"dl_batch_{batch_db_id}")
     builder.button(text="💬 Поддержка", url="https://t.me/baur_bkh")
-    builder.adjust(1, 1)
+    builder.adjust(1, 1, 1)
     return builder.as_markup()
 
 
@@ -419,16 +438,16 @@ def get_settings_inline_keyboard(duplicate_enabled: bool, paper_format: str):
     dup_status = "🟢 ВКЛ" if duplicate_enabled else "🔴 ВЫКЛ"
     
     formats_labels = {
-        "thermal": "🏷 Термопринтер (Без изм.)",
-        "a4_crop_thermal": "✂️ А4 на термопринтер (Обрезка)",
-        "a4_4in1": "📄 4 на 1 лист (А4)",
-        "a4_8in1": "📄 8 на 1 лист (А4)",
-        "a4_9in1": "📄 9 на 1 лист (А4)"
+        "thermal": "🏷 Термопринтер",
+        "a4_crop_thermal": "✂️ Обрезка А4",
+        "a4_4in1": "📄 4 в 1 (А4)",
+        "a4_8in1": "📄 8 в 1 (А4)",
+        "a4_9in1": "📄 9 в 1 (А4)"
     }
     current_fmt_label = formats_labels.get(paper_format, "🏷 Термопринтер")
     
-    builder.button(text=f"📄 Дублирование этикеток: [{dup_status}]", callback_data="toggle_duplicate")
-    builder.button(text=f"🖨 Формат печати: [{current_fmt_label}]", callback_data="change_paper_format")
+    builder.button(text=f"📄 Дублирование: [{dup_status}]", callback_data="toggle_duplicate")
+    builder.button(text=f"🖨 Формат: [{current_fmt_label}]", callback_data="change_paper_format")
     builder.adjust(1, 1)
     return builder.as_markup()
 
@@ -436,7 +455,7 @@ def get_settings_inline_keyboard(duplicate_enabled: bool, paper_format: str):
 def get_paper_format_keyboard():
     builder = InlineKeyboardBuilder()
     builder.button(text="🏷 Термопринтер (Без изменений)", callback_data="set_fmt_thermal")
-    builder.button(text="✂️ А4 на термопринтер (Авто-обрезка 1/4 листа)", callback_data="set_fmt_a4_crop_thermal")
+    builder.button(text="✂️ А4 на термопринтер (Обрезка)", callback_data="set_fmt_a4_crop_thermal")
     builder.button(text="📄 4 на 1 лист (А4 с пунктиром)", callback_data="set_fmt_a4_4in1")
     builder.button(text="📄 8 на 1 лист (А4 с пунктиром)", callback_data="set_fmt_a4_8in1")
     builder.button(text="📄 9 на 1 лист (А4 с пунктиром)", callback_data="set_fmt_a4_9in1")
@@ -455,7 +474,7 @@ TARIFFS_MAIN_TEXT = (
     "└ 1 200 накладных. ~4.1 ₸ за документ.\n\n"
     "♾ <b>Безлимитные подписки (без ограничений)</b>\n\n"
     "• <b>1 месяц</b> — <b>2 990 ₸</b>\n"
-    "└ Полный безлимит на 30 дней + Авто-сортировка курьеров.\n\n"
+    "└ Полный безлимит на 30 дней.\n\n"
     "• <b>3 месяца</b> — <b>7 470 ₸</b> <i>(2 490 ₸/мес, скидка 15%)</i>\n"
     "└ Полный безлимит на 90 дней.\n\n"
     "• <b>6 месяцев</b> — <b>12 900 ₸</b> <i>(2 150 ₸/мес, скидка 28%)</i>\n"
@@ -496,7 +515,7 @@ def get_subscriptions_keyboard() -> InlineKeyboardMarkup:
         ]
     )
 
-# --- ГЕНЕРАЦИЯ ШТАМПОВ НУМЕРАЦИИ (БЕЗ ОБЛОЖЕК) ---
+# --- ГЕНЕРАЦИЯ ШТАМПОВ НУМЕРАЦИИ ---
 def create_number_stamp(current_idx: int, total_orders: int, is_landscape: bool = False) -> io.BytesIO:
     packet = io.BytesIO()
     pagesize = (340, 212) if is_landscape else (212, 340)
@@ -655,7 +674,7 @@ async def admin_manage_limits(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
     args = message.text.split()
     if len(args) < 3:
-        await message.answer("⚙️ Лимиты: /ksprnt +15 @username | /ksprnt set 500 @username", parse_mode="HTML")
+        await message.answer("⚙ Лимиты: /ksprnt +15 @username | /ksprnt set 500 @username", parse_mode="HTML")
         return
     action, target = args[1], args[2].replace("@", "")
     conn = sqlite3.connect("db.sqlite3")
@@ -681,11 +700,88 @@ async def start_handler(message: types.Message):
     if user_info["is_new_user"] and referrer_id and referrer_id != message.from_user.id:
         try: await bot.send_message(referrer_id, "🎉 <b>По вашей ссылке зарегистрировался селлер!</b>\nВам зачислено +10 обработок!", parse_mode="HTML")
         except: pass
-    await message.answer("🖨 <b>KaspiPrint — Сервис склейки накладных Kaspi</b>\nОтправьте файлы для сортировки и печати.", reply_markup=get_main_keyboard(), parse_mode="HTML")
+    await message.answer("🖨 <b>KaspiPrint — Сервис склейки накладных Kaspi</b>\nОтправьте файлы для обработки и печати.", reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 @dp.message(F.text == "🚀 Старт бота")
 async def start_work_button(message: types.Message):
     await message.answer("📤 <b>Жду ваши файлы!</b>\nОтправьте ZIP-архив или несколько PDF.", reply_markup=get_main_keyboard(), parse_mode="HTML")
+
+@dp.message(F.text == "📦 Мои партии")
+async def show_user_batches(message: types.Message):
+    user_id = message.from_user.id
+    conn = sqlite3.connect("db.sqlite3")
+    cursor = conn.cursor()
+    
+    cutoff_time = (datetime.now() - timedelta(hours=24)).isoformat()
+    cursor.execute("""
+        SELECT id, orders_count, processed_at, file_path 
+        FROM batch_history 
+        WHERE user_id = ? AND processed_at >= ? 
+        ORDER BY id DESC
+    """, (user_id, cutoff_time))
+    batches = cursor.fetchall()
+    conn.close()
+
+    if not batches:
+        await message.answer(
+            "📂 <b>У вас нет активных партий за последние 24 часа.</b>\n\n"
+            "Сформированные партии хранятся в течение 24 часов с момента создания.",
+            reply_markup=get_main_keyboard(),
+            parse_mode="HTML"
+        )
+        return
+
+    builder = InlineKeyboardBuilder()
+    text = "📦 <b>Ваши партии за последние 24 часа:</b>\nВыберите партию для повторного скачивания:\n\n"
+    
+    for idx, (b_id, orders_cnt, proc_at, f_path) in enumerate(batches, 1):
+        try:
+            dt_obj = datetime.fromisoformat(proc_at)
+            time_str = dt_obj.strftime("%d.%m.%Y %H:%M")
+        except:
+            time_str = proc_at
+            
+        text += f"{idx}. Партия от <b>{time_str}</b> — <code>{orders_cnt} заказов</code>\n"
+        builder.button(text=f"📥 Скачать партию #{idx} ({orders_cnt} шт.)", callback_data=f"dl_batch_{b_id}")
+    
+    builder.adjust(1)
+    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("dl_batch_"))
+async def process_redownload_batch(callback: CallbackQuery):
+    try:
+        batch_db_id = int(callback.data.split("_")[-1])
+    except ValueError:
+        return await callback.answer("❌ Неверный идентификатор партии.", show_alert=True)
+        
+    user_id = callback.from_user.id
+    conn = sqlite3.connect("db.sqlite3")
+    cursor = conn.cursor()
+    cursor.execute("SELECT file_path, processed_at, orders_count FROM batch_history WHERE id = ? AND user_id = ?", (batch_db_id, user_id))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        return await callback.answer("⚠️ Партия не найдена или устарела.", show_alert=True)
+        
+    file_path, processed_at, orders_count = row
+    
+    try:
+        proc_dt = datetime.fromisoformat(processed_at)
+        if datetime.now() - proc_dt > timedelta(hours=24):
+            return await callback.answer("⏳ Время хранения этой партии (24 часа) истекло.", show_alert=True)
+    except Exception:
+        pass
+        
+    if not file_path or not os.path.exists(file_path):
+        return await callback.answer("❌ Файл партии не найден на сервере.", show_alert=True)
+        
+    await callback.message.answer_document(
+        document=types.FSInputFile(file_path),
+        caption=f"📥 <b>Повторная выгрузка партии</b>\n📦 Заказов: <code>{orders_count} шт.</code>",
+        parse_mode="HTML"
+    )
+    await callback.answer("✅ Файл успешно отправлен!")
 
 @dp.message(F.text == "🎁 Приведи друга")
 async def referral_program_handler(message: types.Message):
@@ -700,7 +796,7 @@ async def show_settings(message: types.Message):
 
 @dp.callback_query(F.data == "change_paper_format")
 async def process_change_paper_format(callback: CallbackQuery):
-    await callback.message.edit_text("🖨 <b>Выберите используемый формат бумаги / принтера:</b>", reply_markup=get_paper_format_keyboard(), parse_mode="HTML")
+    await callback.message.edit_text("🖨 <b>Выберите формат печати:</b>", reply_markup=get_paper_format_keyboard(), parse_mode="HTML")
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("set_fmt_"))
@@ -762,8 +858,9 @@ async def process_tariff_selection(callback: CallbackQuery):
 async def process_show_picklist(callback: CallbackQuery):
     picklist_data = user_pick_lists.get(f"{callback.from_user.id}_{callback.data.split('_')[-1]}")
     if not picklist_data: return await callback.answer("⚠️ Данные Листа сборки устарели.", show_alert=True)
-    text = f"📦 <b>Лист сборки заказов:</b>\n\n"
-    for item, qty in picklist_data.items(): text += f"• {item} — <b>{qty} шт.</b>\n"
+    text = f"📦 <b>Лист сборки заказов (товары):</b>\n\n"
+    for item, qty in picklist_data.items(): 
+        text += f"• {item} — <b>{qty} шт.</b>\n"
     await callback.message.answer(text, parse_mode="HTML")
     await callback.answer()
 
@@ -788,6 +885,7 @@ async def process_user_files(user_id: int, message: types.Message):
     user_data = get_or_create_user(user_id, message.from_user.username)
     duplicate_enabled = user_data["duplicate_mode"]
     paper_format = user_data["paper_format"]
+    
     valid_files = [doc for doc in files_list if (os.path.splitext(doc.file_name)[1].lower() if doc.file_name else "") in [".pdf", ".zip"]]
     
     if not valid_files:
@@ -795,7 +893,7 @@ async def process_user_files(user_id: int, message: types.Message):
 
     user_dir = f"./temp_{user_id}"
     os.makedirs(user_dir, exist_ok=True)
-    status_msg = await message.answer(f"📥 Обработка {len(valid_files)} файл(ов)...")
+    status_msg = await message.answer(f"📥 Скачивание и анализ файлов...")
     pdf_files = []
 
     try:
@@ -819,24 +917,40 @@ async def process_user_files(user_id: int, message: types.Message):
             shutil.rmtree(user_dir, ignore_errors=True)
             return await status_msg.edit_text("❌ В файлах нет PDF.")
 
-        grouped_pages, picklist_data = parse_and_sort_pdf_pages(pdf_files)
+        # БЫСТРЫЙ ПОДСЧЕТ ЗАКАЗОВ ДО ОБРАБОТКИ
+        grouped_pages, picklist_data = parse_pdf_pages_without_sorting(pdf_files)
         total_orders = sum(len(pages) for pages in grouped_pages.values())
         
-        if not user_data["has_active_sub"] and (user_data["used_today"] + total_orders > user_data["max_allowed"]):
-            shutil.rmtree(user_dir, ignore_errors=True)
-            return await status_msg.edit_text("🛑 Превышен лимит! Оформите подписку.")
+        # АВТОМАТИЧЕСКАЯ ПРОВЕРКА ЛИМИТОВ
+        if not user_data["has_active_sub"]:
+            remaining_limit = user_data["max_allowed"] - user_data["used_today"]
+            if total_orders > remaining_limit:
+                needed = total_orders - remaining_limit
+                shutil.rmtree(user_dir, ignore_errors=True)
+                
+                # Создаем инлайн-кнопку для мгновенной покупки пакета / пополнения
+                buy_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⚡️️ Докупить лимиты / Оплатить", callback_data="category_packages")],
+                    [InlineKeyboardButton(text="💬 Связаться с менеджером", url="https://t.me/baur_bkh")]
+                ])
+                
+                limit_msg = (
+                    f"🛑 <b>Недостаточно лимитов на балансе!</b>\n\n"
+                    f"📦 В архиве обнаружено: <code>{total_orders} заказов</code>\n"
+                    f"⚖️ Доступно на балансе: <code>{max(0, remaining_limit)} шт.</code>\n"
+                    f"❌ Не хватает: <b>{needed} шт.</b>\n\n"
+                    f"Хотите докупить пакет накладных прямо здесь?"
+                )
+                return await status_msg.edit_text(limit_msg, reply_markup=buy_keyboard, parse_mode="HTML")
 
-        now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
         await status_msg.edit_text(f"⚙️ Подготовка: ПАРТИЯ №{current_batch_number} ({total_orders} заказов)...")
         if picklist_data: user_pick_lists[f"{user_id}_{current_batch_number}"] = picklist_data
 
         writer = PdfWriter()
         
         current_global_idx = 1
-        delivery_summary_text = ""
         processed_pages_stream = []
 
-        # Форматы А4 обрабатываем через буфер
         is_a4_grid = paper_format in ["a4_4in1", "a4_8in1", "a4_9in1"]
         
         for group_title, pages in grouped_pages.items():
@@ -865,39 +979,37 @@ async def process_user_files(user_id: int, message: types.Message):
 
                 current_global_idx += 1
 
-            delivery_summary_text += f"• {group_title}: <b>{len(pages)} шт.</b>\n"
-
         if is_a4_grid:
             mode_type = paper_format.replace("a4_", "")
             n_up_writer = merge_pages_n_up(processed_pages_stream, mode=mode_type)
             for page_n in n_up_writer.pages: writer.add_page(page_n)
 
-        output_pdf_path = os.path.join(user_dir, f"ПАРТИЯ_№{current_batch_number}.pdf")
+        output_pdf_filename = f"user_{user_id}_batch_{current_batch_number}_{int(datetime.now().timestamp())}.pdf"
+        output_pdf_path = os.path.join(STORAGE_DIR, output_pdf_filename)
         with open(output_pdf_path, "wb") as f_out: writer.write(f_out)
 
-        update_user_usage_and_batch(user_id, total_orders)
+        batch_db_id = update_user_usage_and_batch(user_id, total_orders, output_pdf_path)
         
         fmt_notes = {
             "thermal": "🏷 Термопринтер",
             "a4_crop_thermal": "✂️ Обрезка А4",
-            "a4_4in1": "📄 4 на 1 лист (А4)",
-            "a4_8in1": "📄 8 на 1 лист (А4)",
-            "a4_9in1": "📄 9 на 1 лист (А4)"
+            "a4_4in1": "📄 4 в 1 (А4)",
+            "a4_8in1": "📄 8 в 1 (А4)",
+            "a4_9in1": "📄 9 в 1 (А4)"
         }
 
         summary_msg = (
             f"✅ <b>ПАРТИЯ №{current_batch_number} сформирована!</b>\n\n"
-            f"🚚 <b>Службы доставки:</b>\n{delivery_summary_text}\n"
             f"📦 <b>Заказов:</b> <code>{total_orders} шт.</code>\n"
-            f"🖨 <b>Формат бумаги:</b> {fmt_notes.get(paper_format, '')}\n"
-            f"💡 <i>Нажмите «Показать Лист сборки» ниже.</i>"
+            f"🖨 <b>Формат:</b> {fmt_notes.get(paper_format, '')}\n"
+            f"💡 <i>Файл доступен для повторного скачивания в разделе «Мои партии» в течение 24 часов.</i>"
         )
 
         await status_msg.delete()
         await message.answer_document(
             document=types.FSInputFile(output_pdf_path),
             caption=summary_msg,
-            reply_markup=get_batch_result_keyboard(current_batch_number),
+            reply_markup=get_batch_result_keyboard(batch_db_id, current_batch_number),
             parse_mode="HTML"
         )
 
@@ -916,7 +1028,7 @@ async def handle_document(message: types.Message):
     user_tasks[user_id] = asyncio.create_task(process_user_files(user_id, message))
 
 async def main():
-    print("🚀 Бот @ksp_print с улучшенной раскладкой на А4 запущен!")
+    print("🚀 Бот @ksp_print запущен с автоматической проверкой лимитов в архиве!")
     asyncio.create_task(check_subscription_expirations())
     await dp.start_polling(bot)
 
